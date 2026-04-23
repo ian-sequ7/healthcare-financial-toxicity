@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Variable Codebook: Healthcare Financial Toxicity Project</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Variable Codebook: Healthcare Financial Toxicity
+Project</h1>
+</header>
+<h1
+id="variable-codebook-healthcare-financial-toxicity-project">Variable
+Codebook: Healthcare Financial Toxicity Project</h1>
+<p><strong>Data Source</strong>: 2022 Medical Expenditure Panel Survey
+(MEPS) Full Year Consolidated Data File (HC-243)</p>
+<p><strong>Citation</strong>: Agency for Healthcare Research and
+Quality. (2024). <em>Medical Expenditure Panel Survey HC-243: 2022 Full
+Year Consolidated Data File</em>. Rockville, MD: AHRQ. Retrieved from <a
+href="https://meps.ahrq.gov/data_stats/download_data_files_detail.jsp?cboPufNumber=HC-243"
+class="uri">https://meps.ahrq.gov/data_stats/download_data_files_detail.jsp?cboPufNumber=HC-243</a></p>
+<p><strong>Full MEPS Codebook</strong>: See <code>h243cb.pdf</code> in
+the project repository for documentation of all 1,420 variables in the
+HC-243 file.</p>
+<hr />
+<h2 id="selected-meps-variables-40-total">Selected MEPS Variables (40
+total)</h2>
+<h3 id="identifiers-survey-design">Identifiers &amp; Survey Design</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DUPERSID</td>
+<td>Person-level identifier</td>
+<td>ID</td>
+<td>Excluded from models</td>
+</tr>
+<tr>
+<td>PERWT22F</td>
+<td>Person-level survey weight</td>
+<td>Weight</td>
+<td>Used for weighted descriptives only</td>
+</tr>
+<tr>
+<td>VARSTR</td>
+<td>Variance estimation stratum</td>
+<td>Design</td>
+<td>Used for survey design specification</td>
+</tr>
+<tr>
+<td>VARPSU</td>
+<td>Variance estimation PSU</td>
+<td>Design</td>
+<td>Used for survey design specification</td>
+</tr>
+</tbody>
+</table>
+<h3 id="demographics">Demographics</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AGE22X</td>
+<td>Age as of 12/31/2022</td>
+<td>Continuous</td>
+<td>Predictor</td>
+</tr>
+<tr>
+<td>SEX</td>
+<td>Sex (1=Male, 2=Female)</td>
+<td>Binary</td>
+<td>Recoded to <code>sex</code></td>
+</tr>
+<tr>
+<td>RACETHX</td>
+<td>Race/ethnicity (1=Hispanic, 2=NH White, 3=NH Black, 4=NH Asian, 5=NH
+Other/Multiple)</td>
+<td>Categorical</td>
+<td>Recoded to <code>race_eth</code></td>
+</tr>
+<tr>
+<td>EDUCYR</td>
+<td>Years of education</td>
+<td>Continuous</td>
+<td>Predictor</td>
+</tr>
+<tr>
+<td>REGION22</td>
+<td>Census region (1=Northeast, 2=Midwest, 3=South, 4=West)</td>
+<td>Categorical</td>
+<td>Recoded to <code>region</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="economic">Economic</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FAMINC22</td>
+<td>Total family income ($)</td>
+<td>Continuous</td>
+<td>Outcome component (denominator); excluded from models</td>
+</tr>
+<tr>
+<td>POVCAT22</td>
+<td>Poverty category (1=Poor/Negative, 2=Near Poor, 3=Low Income,
+4=Middle Income, 5=High Income)</td>
+<td>Ordinal</td>
+<td>Recoded to <code>poverty</code>; Predictor</td>
+</tr>
+</tbody>
+</table>
+<h3 id="insurance">Insurance</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INSCOV22</td>
+<td>Insurance coverage (1=Private, 2=Public Only, 3=Uninsured)</td>
+<td>Categorical</td>
+<td>Recoded to <code>insurance</code>; Predictor</td>
+</tr>
+</tbody>
+</table>
+<h3 id="health-status">Health Status</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RTHLTH53</td>
+<td>Perceived physical health status (1=Excellent to 5=Poor)</td>
+<td>Ordinal</td>
+<td>Recoded to <code>health_phys</code>; Predictor</td>
+</tr>
+<tr>
+<td>MNHLTH53</td>
+<td>Perceived mental health status (1=Excellent to 5=Poor)</td>
+<td>Ordinal</td>
+<td>Recoded to <code>health_ment</code>; Predictor</td>
+</tr>
+</tbody>
+</table>
+<h3 id="chronic-conditions">Chronic Conditions</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DIABDX_M18</td>
+<td>Ever diagnosed with diabetes (1=Yes, 2=No)</td>
+<td>Binary</td>
+<td>Recoded to <code>diabetes</code>; Predictor</td>
+</tr>
+<tr>
+<td>HIBPDX</td>
+<td>Ever diagnosed with high blood pressure (1=Yes, 2=No)</td>
+<td>Binary</td>
+<td>Recoded to <code>highbp</code>; Predictor</td>
+</tr>
+<tr>
+<td>ASTHDX</td>
+<td>Ever diagnosed with asthma (1=Yes, 2=No)</td>
+<td>Binary</td>
+<td>Recoded to <code>asthma</code>; Predictor</td>
+</tr>
+<tr>
+<td>ARTHDX</td>
+<td>Ever diagnosed with arthritis (1=Yes, 2=No)</td>
+<td>Binary</td>
+<td>Recoded to <code>arthritis</code>; Predictor</td>
+</tr>
+<tr>
+<td>CANCERDX</td>
+<td>Ever diagnosed with cancer (1=Yes, 2=No)</td>
+<td>Binary</td>
+<td>Recoded to <code>cancer</code>; Predictor</td>
+</tr>
+<tr>
+<td>STRKDX</td>
+<td>Ever diagnosed with stroke (1=Yes, 2=No)</td>
+<td>Binary</td>
+<td>Recoded to <code>stroke</code>; Predictor</td>
+</tr>
+</tbody>
+</table>
+<h3 id="access-to-care">Access to Care</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DLAYCA42</td>
+<td>Delayed medical care due to cost (1=Yes, 2=No)</td>
+<td>Binary</td>
+<td>Recoded to <code>delayed_care</code>; Predictor</td>
+</tr>
+<tr>
+<td>AFRDCA42</td>
+<td>Unable to get necessary care due to cost (1=Yes, 2=No)</td>
+<td>Binary</td>
+<td>Recoded to <code>forgone_care</code>; Predictor</td>
+</tr>
+</tbody>
+</table>
+<h3 id="employment-social">Employment &amp; Social</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EMPST53H</td>
+<td>Employment status (1=Employed, 2=Job to return to, 34=Not employed;
+negatives=NA)</td>
+<td>Categorical</td>
+<td>Recoded to <code>employment</code>; Predictor</td>
+</tr>
+<tr>
+<td>ANYLMI22</td>
+<td>Any functional or activity limitation (1=Yes, 2=No;
+negatives=NA)</td>
+<td>Binary</td>
+<td>Recoded to <code>any_limitation</code>; Predictor</td>
+</tr>
+<tr>
+<td>MARRY22X</td>
+<td>Marital status (1=Married, 2=Widowed, 3=Divorced, 4=Separated,
+5=Never married; negatives &amp; 6=NA)</td>
+<td>Categorical</td>
+<td>Recoded to <code>marital_status</code>; Predictor</td>
+</tr>
+</tbody>
+</table>
+<h3 id="healthcare-utilization">Healthcare Utilization</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OBTOTV22</td>
+<td>Total office-based visits</td>
+<td>Count</td>
+<td>Sensitivity analysis only (leakage risk)</td>
+</tr>
+<tr>
+<td>ERTOT22</td>
+<td>Total ER visits</td>
+<td>Count</td>
+<td>Sensitivity analysis only (leakage risk)</td>
+</tr>
+<tr>
+<td>IPDIS22</td>
+<td>Total inpatient discharges</td>
+<td>Count</td>
+<td>Sensitivity analysis only (leakage risk)</td>
+</tr>
+<tr>
+<td>HHTOTD22</td>
+<td>Total home health days</td>
+<td>Count</td>
+<td>Sensitivity analysis only (leakage risk)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="expenditures">Expenditures</h3>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 37%" />
+<col style="width: 17%" />
+<col style="width: 17%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TOTEXP22</td>
+<td>Total healthcare expenditures (<span
+class="math inline">)|<em>C</em><em>o</em><em>n</em><em>t</em><em>i</em><em>n</em><em>u</em><em>o</em><em>u</em><em>s</em>|<em>D</em><em>e</em><em>s</em><em>c</em><em>r</em><em>i</em><em>p</em><em>t</em><em>i</em><em>v</em><em>e</em><em>o</em><em>n</em><em>l</em><em>y</em>||<em>T</em><em>O</em><em>T</em><em>S</em><em>L</em><em>F</em>22|<em>T</em><em>o</em><em>t</em><em>a</em><em>l</em><em>o</em><em>u</em><em>t</em> − <em>o</em><em>f</em> − <em>p</em><em>o</em><em>c</em><em>k</em><em>e</em><em>t</em><em>e</em><em>x</em><em>p</em><em>e</em><em>n</em><em>d</em><em>i</em><em>t</em><em>u</em><em>r</em><em>e</em><em>s</em>(</span>)</td>
+<td>Continuous</td>
+<td>Outcome component (numerator); excluded from models</td>
+</tr>
+<tr>
+<td>TOTMCR22</td>
+<td>Total Medicare payments (<span
+class="math inline">)|<em>C</em><em>o</em><em>n</em><em>t</em><em>i</em><em>n</em><em>u</em><em>o</em><em>u</em><em>s</em>|<em>D</em><em>e</em><em>s</em><em>c</em><em>r</em><em>i</em><em>p</em><em>t</em><em>i</em><em>v</em><em>e</em><em>o</em><em>n</em><em>l</em><em>y</em>||<em>T</em><em>O</em><em>T</em><em>M</em><em>C</em><em>D</em>22|<em>T</em><em>o</em><em>t</em><em>a</em><em>l</em><em>M</em><em>e</em><em>d</em><em>i</em><em>c</em><em>a</em><em>i</em><em>d</em><em>p</em><em>a</em><em>y</em><em>m</em><em>e</em><em>n</em><em>t</em><em>s</em>(</span>)</td>
+<td>Continuous</td>
+<td>Descriptive only</td>
+</tr>
+<tr>
+<td>TOTPRV22</td>
+<td>Total private insurance payments (<span
+class="math inline">)|<em>C</em><em>o</em><em>n</em><em>t</em><em>i</em><em>n</em><em>u</em><em>o</em><em>u</em><em>s</em>|<em>D</em><em>e</em><em>s</em><em>c</em><em>r</em><em>i</em><em>p</em><em>t</em><em>i</em><em>v</em><em>e</em><em>o</em><em>n</em><em>l</em><em>y</em>||<em>T</em><em>O</em><em>T</em><em>V</em><em>A</em>22|<em>T</em><em>o</em><em>t</em><em>a</em><em>l</em><em>V</em><em>A</em><em>p</em><em>a</em><em>y</em><em>m</em><em>e</em><em>n</em><em>t</em><em>s</em>(</span>)</td>
+<td>Continuous</td>
+<td>Descriptive only</td>
+</tr>
+<tr>
+<td>TOTTRI22</td>
+<td>Total TRICARE payments (<span
+class="math inline">)|<em>C</em><em>o</em><em>n</em><em>t</em><em>i</em><em>n</em><em>u</em><em>o</em><em>u</em><em>s</em>|<em>D</em><em>e</em><em>s</em><em>c</em><em>r</em><em>i</em><em>p</em><em>t</em><em>i</em><em>v</em><em>e</em><em>o</em><em>n</em><em>l</em><em>y</em>||<em>T</em><em>O</em><em>T</em><em>O</em><em>F</em><em>D</em>22|<em>T</em><em>o</em><em>t</em><em>a</em><em>l</em><em>o</em><em>t</em><em>h</em><em>e</em><em>r</em><em>f</em><em>e</em><em>d</em><em>e</em><em>r</em><em>a</em><em>l</em><em>p</em><em>a</em><em>y</em><em>m</em><em>e</em><em>n</em><em>t</em><em>s</em>(</span>)</td>
+<td>Continuous</td>
+<td>Descriptive only</td>
+</tr>
+<tr>
+<td>TOTWCP22</td>
+<td>Total workers’ compensation payments (<span
+class="math inline">)|<em>C</em><em>o</em><em>n</em><em>t</em><em>i</em><em>n</em><em>u</em><em>o</em><em>u</em><em>s</em>|<em>D</em><em>e</em><em>s</em><em>c</em><em>r</em><em>i</em><em>p</em><em>t</em><em>i</em><em>v</em><em>e</em><em>o</em><em>n</em><em>l</em><em>y</em>||<em>T</em><em>O</em><em>T</em><em>O</em><em>S</em><em>R</em>22|<em>T</em><em>o</em><em>t</em><em>a</em><em>l</em><em>o</em><em>t</em><em>h</em><em>e</em><em>r</em><em>s</em><em>t</em><em>a</em><em>t</em><em>e</em>/<em>l</em><em>o</em><em>c</em><em>a</em><em>l</em><em>p</em><em>a</em><em>y</em><em>m</em><em>e</em><em>n</em><em>t</em><em>s</em>(</span>)</td>
+<td>Continuous</td>
+<td>Descriptive only</td>
+</tr>
+<tr>
+<td>TOTOTH22</td>
+<td>Total other payments ($)</td>
+<td>Continuous</td>
+<td>Descriptive only</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="derived-variables">Derived Variables</h2>
+<table>
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 27%" />
+<col style="width: 12%" />
+<col style="width: 12%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Description</th>
+<th>Type</th>
+<th>Role</th>
+<th>Derivation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>burden_ratio</td>
+<td>OOP-to-income ratio</td>
+<td>Continuous</td>
+<td>Intermediate</td>
+<td>TOTSLF22 / FAMINC22</td>
+</tr>
+<tr>
+<td>high_burden</td>
+<td>Financial burden indicator</td>
+<td>Binary (No/Yes)</td>
+<td>Outcome</td>
+<td>1 if burden_ratio &gt; 0.10</td>
+</tr>
+<tr>
+<td>n_chronic</td>
+<td>Count of chronic conditions (0–6); excluded from models due to
+multicollinearity with individual condition dummies</td>
+<td>Count</td>
+<td>Descriptive</td>
+<td>Sum of DIABDX_M18, HIBPDX, ASTHDX, ARTHDX, CANCERDX, STRKDX (coded
+1=Yes)</td>
+</tr>
+<tr>
+<td>age_group</td>
+<td>Binned age (6 levels)</td>
+<td>Categorical</td>
+<td>Descriptive</td>
+<td>cut(AGE22X, breaks at 18, 25, 35, 45, 55, 65, Inf)</td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>

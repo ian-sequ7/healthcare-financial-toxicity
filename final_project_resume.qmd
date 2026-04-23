@@ -1,0 +1,2108 @@
+---
+title: "Predictive Modeling: Healthcare Financial Toxicity"
+subtitle: "PSTAT 231 Final Project"
+author: "Ian Sequeira"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
+    embed-resources: true
+    fig-width: 10
+    fig-height: 6
+---
+
+## 1. Introduction
+
+Healthcare **financial toxicity** (the economic hardship patients and families face from out-of-pocket medical costs) is a growing problem in the United States. According to data from the Kaiser Family Foundation, roughly one in four adults reports difficulty affording medical bills, and medical debt remains a leading contributor to personal bankruptcy. The problem is not limited to the uninsured either; even people with employer-sponsored coverage can face catastrophic cost-sharing obligations that destabilize household finances. If we want to design better interventions through policy reform, risk-adjusted subsidies, or proactive patient navigation, we first need to understand which demographic, clinical, and access-related factors predict high financial burden.
+
+In this project, we build and evaluate a suite of supervised classification models to predict whether a household experiences **high financial burden** (defined as out-of-pocket healthcare spending exceeding 10% of family income). This threshold is consistent with prior MEPS-based research on financial burden. Bernard et al. (2015) used the same 10% OOP-to-income definition in a CDC study of chronic conditions and out-of-pocket spending. They found that socioeconomic factors, particularly poverty status and insurance type, dominated over specific diagnoses as predictors of high burden. The data source is the **2022 Medical Expenditure Panel Survey (MEPS)** Full Year Consolidated file (HC-243), a nationally representative survey of the U.S. civilian noninstitutionalized population administered by the Agency for Healthcare Research and Quality (AHRQ).
+
+> Agency for Healthcare Research and Quality. (2024). *Medical Expenditure Panel Survey HC-243: 2022 Full Year Consolidated Data File*. Rockville, MD: AHRQ. Retrieved from <https://meps.ahrq.gov/data_stats/download_data_files_detail.jsp?cboPufNumber=HC-243>
+>
+> Bernard, D. M., Selden, T. M., & Pylypchuk, Y. O. (2015). Out-of-pocket spending burden for individuals with chronic conditions varies across conditions, income, and insurance type. *Preventing Chronic Disease*, 12, E140. <https://www.cdc.gov/pcd/issues/2015/14_0388.htm>
+
+The exploratory data analysis (Section 2) establishes the analytic sample and documents the severe class imbalance (roughly 4 to 5% positive rate). It also surfaces strong associations between financial burden and poverty level, insurance type, chronic conditions, and delayed or forgone care. These patterns directly inform our feature engineering and modeling strategy.
+
+We train and compare six classification algorithms of increasing flexibility: logistic regression as a transparent baseline; elastic net for automatic feature selection; random forest for nonlinear interactions; XGBoost for state-of-the-art tabular performance; a radial-basis-function SVM for flexible decision boundaries; and BART for posterior-based uncertainty quantification. All models are evaluated under 10-fold stratified cross-validation using **ROC-AUC** and **PR-AUC** as primary metrics. PR-AUC is particularly informative here given the severe class imbalance. The best-performing model is then evaluated on a held-out test set, and we conduct a sensitivity analysis to assess whether adding healthcare utilization variables (which risk endogeneity) improves discrimination.
+
+The modeling pipeline is implemented using the `tidymodels` framework in R, which provides a unified grammar for specifying recipes, model specifications, workflows, and resampling strategies. The modular design ensures that preprocessing is applied consistently within each cross-validation fold, preventing information leakage that can arise from naive approaches to imputation and normalization. All tuning results are cached to disk so that expensive gradient-boosted or SVM fits do not need to be repeated across rendering sessions.
+
+
+## 2. Exploratory Data Analysis
+
+```{r setup, message=FALSE, warning=FALSE}
+#| label: setup
+
+library(haven)
+library(tidyverse)
+library(tidymodels)
+
+library(glmnet)
+library(ranger)
+library(xgboost)
+library(kernlab)
+library(dbarts)
+
+library(vip)
+library(patchwork)
+library(scales)
+library(gt)
+library(shapviz)
+library(kernelshap)
+
+library(DALEX)
+library(DALEXtra)
+library(fairmodels)
+
+library(doParallel)
+
+theme_set(theme_minimal(base_size = 13))
+
+tidymodels_prefer()
+
+clr_blue  <- "#4682B4"
+clr_red   <- "#CD5C5C"
+clr_green <- "#2E8B57"
+clr_gold  <- "#DAA520"
+pal_burden <- c("No" = clr_blue, "Yes" = clr_red)
+```
+
+The data pipeline below loads the raw 2022 MEPS Full Year Consolidated file (HC-243), applies cohort filters (positive survey weight, positive family income, adults 18+), constructs the high financial burden outcome, recodes all predictor variables, and creates the stratified 80/20 train/test split with 10-fold CV folds. Once built, the processed objects are cached to disk so subsequent renders skip the pipeline entirely.
+
+```{r load-data}
+#| label: load-data
+
+if (file.exists("data/fyc_split.RData")) {
+  load("data/fyc_split.RData")
+} else {
+  recode_meps_missing <- function(x) {
+    ifelse(x < 0, NA, x)
+  }
+
+  fyc_raw <- read_dta("data/h243.dta")
+
+  vars_select <- c(
+    "DUPERSID", "PERWT22F", "VARSTR", "VARPSU",
+    "AGE22X", "SEX", "RACETHX", "EDUCYR", "REGION22",
+    "FAMINC22", "POVCAT22",
+    "INSCOV22",
+    "RTHLTH53", "MNHLTH53",
+    "DIABDX_M18", "HIBPDX", "ASTHDX", "ARTHDX", "CANCERDX", "STRKDX",
+    "DLAYCA42", "AFRDCA42",
+    "OBTOTV22", "ERTOT22", "IPDIS22", "HHTOTD22",
+    "TOTEXP22", "TOTSLF22", "TOTMCR22", "TOTMCD22", "TOTPRV22",
+    "TOTVA22", "TOTTRI22", "TOTOFD22", "TOTWCP22", "TOTOSR22", "TOTOTH22"
+  )
+
+  fyc <- fyc_raw %>% select(all_of(vars_select))
+
+  fyc <- fyc %>% filter(PERWT22F > 0)
+  fyc <- fyc %>% filter(FAMINC22 > 0)
+  fyc <- fyc %>% filter(AGE22X >= 18)
+
+  fyc <- fyc %>%
+    mutate(
+      burden_ratio = TOTSLF22 / FAMINC22,
+      high_burden  = factor(ifelse(burden_ratio > 0.10, 1, 0), levels = c("0", "1"),
+                            labels = c("No", "Yes"))
+    )
+
+  fyc <- fyc %>%
+    mutate(across(c(RTHLTH53, MNHLTH53, EDUCYR, DIABDX_M18, HIBPDX, ASTHDX,
+                    ARTHDX, CANCERDX, STRKDX, DLAYCA42, AFRDCA42,
+                    OBTOTV22, ERTOT22, IPDIS22, HHTOTD22),
+                  recode_meps_missing))
+
+  fyc <- fyc %>%
+    mutate(
+      sex = factor(SEX, levels = 1:2, labels = c("Male", "Female")),
+      race_eth = factor(RACETHX, levels = 1:5,
+                        labels = c("Hispanic", "NH White", "NH Black",
+                                   "NH Asian", "NH Other/Multiple")),
+      region = factor(REGION22, levels = c(-1, 1:4),
+                      labels = c("Unknown", "Northeast", "Midwest", "South", "West")),
+      poverty = factor(POVCAT22, levels = 1:5,
+                       labels = c("Poor/Negative", "Near Poor", "Low Income",
+                                  "Middle Income", "High Income")),
+      insurance = factor(INSCOV22, levels = 1:3,
+                         labels = c("Private", "Public Only", "Uninsured")),
+      health_phys = factor(RTHLTH53, levels = 1:5,
+                           labels = c("Excellent", "Very Good", "Good", "Fair", "Poor")),
+      health_ment = factor(MNHLTH53, levels = 1:5,
+                           labels = c("Excellent", "Very Good", "Good", "Fair", "Poor")),
+      diabetes   = factor(DIABDX_M18, levels = c(2, 1), labels = c("No", "Yes")),
+      highbp     = factor(HIBPDX, levels = c(2, 1), labels = c("No", "Yes")),
+      asthma     = factor(ASTHDX, levels = c(2, 1), labels = c("No", "Yes")),
+      arthritis  = factor(ARTHDX, levels = c(2, 1), labels = c("No", "Yes")),
+      cancer     = factor(CANCERDX, levels = c(2, 1), labels = c("No", "Yes")),
+      stroke     = factor(STRKDX, levels = c(2, 1), labels = c("No", "Yes")),
+      delayed_care = factor(DLAYCA42, levels = c(1, 2), labels = c("Yes", "No")),
+      forgone_care = factor(AFRDCA42, levels = c(1, 2), labels = c("Yes", "No")),
+      age_group  = cut(AGE22X, breaks = c(17, 25, 35, 45, 55, 65, Inf),
+                       labels = c("18-25", "26-35", "36-45", "46-55", "56-65", "65+"))
+    )
+
+  fyc <- fyc %>%
+    mutate(
+      n_chronic = rowSums(across(c(DIABDX_M18, HIBPDX, ASTHDX, ARTHDX, CANCERDX, STRKDX),
+                                 ~ .x == 1), na.rm = TRUE)
+    )
+
+  set.seed(231)
+  fyc_split <- initial_split(fyc, prop = 0.80, strata = high_burden)
+  fyc_train <- training(fyc_split)
+  fyc_test  <- testing(fyc_split)
+
+  set.seed(231)
+  cv_folds <- vfold_cv(fyc_train, v = 10, strata = high_burden)
+
+  save(fyc_split, fyc_train, fyc_test, cv_folds, file = "data/fyc_split.RData")
+}
+```
+
+### 2.1 Data Overview & Codebook
+
+The analytic sample comprises **20,962 adults** (age 18+) drawn from the 2022 MEPS Full Year Consolidated file (HC-243) after excluding observations with non-positive survey weights or family income. We split the sample 80/20 into training (`r format(nrow(fyc_train), big.mark = ",")` observations) and test (`r format(nrow(fyc_test), big.mark = ",")` observations) sets stratified on the outcome `high_burden`. The table below describes the 17 predictor variables and the binary outcome used in modeling. The complete MEPS codebook (1,420 variables) is provided as `h243cb.pdf`.
+
+```{r eda-codebook}
+#| label: eda-codebook
+
+tibble(
+  Variable = c(
+    "AGE22X", "EDUCYR", "sex", "race_eth", "region",
+    "poverty", "insurance",
+    "health_phys", "health_ment",
+    "diabetes", "highbp", "asthma", "arthritis", "cancer", "stroke",
+    "delayed_care", "forgone_care",
+    "n_chronic",
+    "high_burden"
+  ),
+  Description = c(
+    "Age as of 12/31/2022", "Years of education",
+    "Sex (Male/Female)", "Race/ethnicity (5 categories)",
+    "Census region (Northeast/Midwest/South/West)",
+    "Poverty category (Poor/Negative to High Income, 5 levels)",
+    "Insurance coverage (Private/Public Only/Uninsured)",
+    "Self-rated physical health (Excellent to Poor, 5 levels)",
+    "Self-rated mental health (Excellent to Poor, 5 levels)",
+    "Ever diagnosed with diabetes", "Ever diagnosed with high blood pressure",
+    "Ever diagnosed with asthma", "Ever diagnosed with arthritis",
+    "Ever diagnosed with cancer", "Ever diagnosed with stroke",
+    "Delayed medical care due to cost", "Unable to get care due to cost",
+    "Count of 6 tracked chronic conditions (0--6); excluded from models due to multicollinearity",
+    "OOP spending > 10% of family income (outcome)"
+  ),
+  Type = c(
+    "Continuous", "Continuous",
+    "Binary", "Categorical", "Categorical",
+    "Ordinal", "Categorical",
+    "Ordinal", "Ordinal",
+    rep("Binary", 6),
+    "Binary", "Binary",
+    "Count",
+    "Binary"
+  ),
+  Role = c(
+    rep("Predictor", 17),
+    "Descriptive",
+    "Outcome"
+  )
+) %>%
+  gt() %>%
+  tab_header(title = "Variable Codebook: Modeling Variables") %>%
+  tab_footnote(
+    "MEPS negative sentinel codes (-1, -7, -8) were recoded to NA during data preparation. See eda.qmd for full variable selection and recoding details."
+  ) %>%
+  cols_width(Variable ~ px(120), Description ~ px(280), Type ~ px(90), Role ~ px(80))
+```
+
+### 2.2 Missing Data Assessment
+
+MEPS uses negative sentinel codes (-1 = Inapplicable, -7 = Refused, -8 = Don't Know) rather than standard `NA` values. These were recoded to `NA` during cohort construction. The bar chart below shows the percentage of missing values across all candidate variables evaluated during data preparation, including `n_chronic` (descriptive only; not used in modeling due to multicollinearity with individual condition indicators) and the four utilization variables reserved for the sensitivity analysis (Section 10).
+
+```{r eda-missing}
+#| label: eda-missing
+#| fig-height: 5
+
+miss_pct <- fyc_train %>%
+  select(AGE22X, EDUCYR, POVCAT22, INSCOV22, RTHLTH53, MNHLTH53,
+         DIABDX_M18, HIBPDX, ASTHDX, ARTHDX, CANCERDX, STRKDX,
+         DLAYCA42, AFRDCA42, n_chronic, OBTOTV22, ERTOT22, IPDIS22, HHTOTD22) %>%
+  summarise(across(everything(), ~ mean(is.na(.x)) * 100)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Pct_Missing") %>%
+  arrange(desc(Pct_Missing))
+
+ggplot(miss_pct, aes(x = reorder(Variable, Pct_Missing), y = Pct_Missing)) +
+  geom_col(fill = clr_blue, alpha = 0.8) +
+  geom_text(aes(label = paste0(round(Pct_Missing, 1), "%")),
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(x = NULL, y = "% Missing",
+       title = "Missing Data by Variable",
+       subtitle = "After recoding MEPS negative sentinel values to NA") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+Missingness is very low across the board, less than 1% for most variables. This reflects MEPS's strong imputation procedures for financial and demographic variables. The remaining missing values primarily come from legitimate "Inapplicable" codes for adults who were not asked certain questions. Given how little data is missing, we can justify simple median/mode imputation in our recipe rather than more involved methods like multiple imputation.
+
+### 2.3 Outcome Distribution
+
+```{r eda-outcome}
+#| label: eda-outcome
+#| fig-height: 4
+#| fig-width: 5
+
+fyc_train %>%
+  count(high_burden) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = high_burden, y = n, fill = high_burden)) +
+  geom_col(alpha = 0.85, width = 0.6) +
+  geom_text(aes(label = paste0(format(n, big.mark = ","), "\n(",
+                                round(pct, 1), "%)")),
+            vjust = -0.3, size = 4) +
+  scale_fill_manual(values = pal_burden) +
+  labs(x = "High Financial Burden", y = "Count",
+       title = "Severe Class Imbalance: ~5% Positive Rate") +
+  theme(legend.position = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+The training set has severe class imbalance: about 95% of observations report no high financial burden, and only ~5% are positive cases. A naive classifier that predicts "No" for every observation would achieve ~95% accuracy while being completely useless for identifying at-risk households. This is exactly why we use **ROC-AUC** (discrimination across all thresholds) and **PR-AUC** (precision-recall under imbalance) as our primary evaluation metrics rather than accuracy.
+
+### 2.4 Financial Burden Landscape
+
+The scatterplot below is probably the most direct visualization of our research question. Each point represents an individual and the dashed line marks the 10% OOP-to-income threshold. Anyone above the line is classified as experiencing high financial burden.
+
+```{r eda-scatter}
+#| label: eda-scatter
+#| fig-height: 6
+#| fig-width: 8
+
+fyc_train %>%
+  filter(TOTSLF22 > 0) %>%
+  ggplot(aes(x = FAMINC22, y = TOTSLF22, color = high_burden)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_abline(slope = 0.10, intercept = 0, linetype = "dashed",
+              color = "black", linewidth = 0.8) +
+  scale_x_continuous(labels = dollar_format(), limits = c(0, 200000)) +
+  scale_y_continuous(labels = dollar_format(), limits = c(0, 30000)) +
+  scale_color_manual(values = pal_burden, name = "High Burden") +
+  annotate("text", x = 150000, y = 150000 * 0.10 + 1000,
+           label = "10% threshold", fontface = "italic", size = 3.5) +
+  labs(x = "Family Income ($)", y = "Out-of-Pocket Spending ($)",
+       title = "Financial Burden = Above the Line",
+       subtitle = "Most burdened individuals have low income, not necessarily high spending") +
+  theme(legend.position = "top")
+```
+
+The scatterplot reveals something important: high financial burden is overwhelmingly driven by **low income** rather than extreme medical spending. Most burdened individuals (red points) cluster on the left side of the plot (low income) rather than the top (high spending). So it is poverty, not medical catastrophe, that primarily drives financial toxicity in this population.
+
+### 2.5 Key Predictor Relationships
+
+```{r eda-poverty}
+#| label: eda-poverty
+#| fig-height: 5
+#| fig-width: 8
+
+burden_by_poverty <- fyc_train %>%
+  filter(!is.na(poverty)) %>%
+  group_by(poverty) %>%
+  summarise(
+    rate = mean(high_burden == "Yes") * 100,
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(burden_by_poverty, aes(x = poverty, y = rate, fill = rate)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = paste0(round(rate, 1), "%")), vjust = -0.5, size = 4) +
+  scale_fill_gradient(low = clr_blue, high = clr_red, guide = "none") +
+  labs(x = "Poverty Category", y = "Burden Rate (%)",
+       title = "Poverty Is the Strongest Predictor of Financial Burden",
+       subtitle = "Burden rate shows a steep gradient from Poor/Negative to High Income") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+The gradient here is striking. Adults in the poorest category face a burden rate roughly 11 times higher than high-income adults. This order-of-magnitude difference confirms poverty as the single strongest predictor and motivates its central role in the modeling pipeline. The near-poor and low-income groups also face elevated risk, suggesting the relationship is not simply a binary poor/non-poor distinction but a graded dose-response pattern.
+
+### 2.6 Feature Correlations with Outcome
+
+```{r eda-correlations}
+#| label: eda-correlations
+#| fig-height: 5
+#| fig-width: 8
+
+outcome_binary <- as.numeric(fyc_train$high_burden == "Yes")
+
+corr_with_outcome <- fyc_train %>%
+  select(AGE22X, EDUCYR, POVCAT22, INSCOV22, RTHLTH53, MNHLTH53,
+         DIABDX_M18, HIBPDX, ASTHDX, ARTHDX, CANCERDX, STRKDX,
+         DLAYCA42, AFRDCA42, n_chronic, OBTOTV22, ERTOT22, IPDIS22, HHTOTD22) %>%
+  summarise(across(everything(), ~ cor(.x, outcome_binary, use = "complete.obs",
+                                        method = "spearman"))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Correlation") %>%
+  arrange(desc(abs(Correlation)))
+
+ggplot(corr_with_outcome, aes(x = reorder(Variable, abs(Correlation)),
+                               y = Correlation,
+                               fill = Correlation > 0)) +
+  geom_col(alpha = 0.8) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = clr_red, "FALSE" = clr_blue),
+                    labels = c("Negative", "Positive"), name = "Direction") +
+  labs(x = NULL, y = "Spearman Correlation with High Burden",
+       title = "Feature Correlations with Outcome",
+       subtitle = "POVCAT22 (poverty) shows the strongest association") +
+  geom_hline(yintercept = 0, linetype = "dashed")
+```
+
+The correlation bar chart ranks all candidate predictors by their marginal Spearman correlation with the high-burden indicator. Poverty category (`POVCAT22`) dominates with the strongest negative correlation (higher category = higher income = less burden). Healthcare utilization variables and chronic condition counts follow. Demographic variables like education and age show weaker marginal associations, but they may still contribute meaningfully through interactions in multivariate models.
+
+### 2.7 Modeling Implications
+
+The EDA reveals several patterns that directly inform our modeling strategy:
+
+- **Class imbalance** (~5% positive rate) renders accuracy misleading. We evaluate models using ROC-AUC and PR-AUC under stratified 10-fold cross-validation.
+- **Poverty as dominant predictor** suggests that even simple models may achieve reasonable discrimination, but tree-based models should capture the nonlinear interactions between poverty, insurance, and chronic conditions more effectively.
+- **Interaction effects** are critical in this domain. The **poverty x insurance** interaction is particularly important. Choi et al. (2020) showed that publicly insured individuals appear to have higher burden rates only because they are disproportionately poor (a compositional artifact). Similarly, age x poverty and health status x diabetes interactions amplify burden risk multiplicatively. These patterns motivate the inclusion of flexible learners (random forest and XGBoost) that discover interactions natively through recursive partitioning rather than requiring explicit interaction term specification.
+- **Utilization variables** (office visits, ER visits, inpatient stays, and home health days) carry leakage risk because they are recorded contemporaneously with the out-of-pocket spending used to define the outcome. We exclude them from the base model and assess their contribution in a dedicated sensitivity analysis (Section 10).
+- **Low missingness** (<1% for most variables) justifies simple median/mode imputation rather than more involved multiple imputation approaches.
+
+A comprehensive exploratory analysis with full visualizations, survey-weighted estimates, and interaction heatmaps is available in the companion document `eda.qmd`.
+
+
+## 3. Setup & Preprocessing
+
+This section handles outcome releveling, ordinal factor conversion, cross-validation fold creation, and parallel backend registration. These are all preprocessing steps needed before model training but logically separate from the exploratory analysis above.
+
+::: {.callout-note}
+## Critical: Releveling the Outcome Variable
+By default `tidymodels` treats the **first** factor level as the positive class when computing probability-based metrics like ROC-AUC. Since our outcome `high_burden` is coded with "No" first alphabetically we must relevel it so that "Yes" is the first (positive) level. Failing to do this would cause all discrimination metrics to be computed for the wrong class.
+:::
+
+```{r relevel-outcome}
+#| label: relevel-outcome
+
+fyc_train <- fyc_train %>%
+  mutate(high_burden = fct_relevel(high_burden, "Yes"))
+
+fyc_test <- fyc_test %>%
+  mutate(high_burden = fct_relevel(high_burden, "Yes"))
+```
+
+Next, we convert the ordinal variables to `ordered()` factors with the correct level ordering. This is required for `step_ordinalscore()` to encode them as integer scores reflecting the natural ordering.
+
+```{r convert-ordinal}
+#| label: convert-ordinal
+
+poverty_levels <- c("Poor/Negative", "Near Poor", "Low Income",
+                    "Middle Income", "High Income")
+health_levels  <- c("Excellent", "Very Good", "Good", "Fair", "Poor")
+
+fyc_train <- fyc_train %>%
+  mutate(
+    poverty     = ordered(poverty, levels = poverty_levels),
+    health_phys = ordered(health_phys, levels = health_levels),
+    health_ment = ordered(health_ment, levels = health_levels)
+  )
+
+fyc_test <- fyc_test %>%
+  mutate(
+    poverty     = ordered(poverty, levels = poverty_levels),
+    health_phys = ordered(health_phys, levels = health_levels),
+    health_ment = ordered(health_ment, levels = health_levels)
+  )
+```
+
+We recreate the cross-validation folds with the updated training data. We use stratified sampling on the outcome to maintain class balance across folds.
+
+```{r cv-folds}
+#| label: cv-folds
+
+set.seed(231)
+cv_folds <- vfold_cv(fyc_train, v = 10, strata = high_burden)
+```
+
+Finally, we register a parallel backend to accelerate the grid-search tuning that follows. We reserve one core for system responsiveness. Parallelization is applied at the resampling level, so each CV fold is fit on a separate core. This provides near-linear speedup for grid-search operations.
+
+```{r parallel-backend}
+#| label: parallel-backend
+
+doParallel::registerDoParallel(cores = parallel::detectCores() - 1)
+```
+
+```{r verify-data}
+#| label: verify-data
+
+cat("Training dimensions:", dim(fyc_train), "\n")
+cat("Test dimensions:    ", dim(fyc_test), "\n")
+cat("\nTraining class balance:\n")
+fyc_train %>% count(high_burden) %>% mutate(prop = n / sum(n))
+```
+
+The training set class distribution confirms the severe imbalance we saw during EDA (~4 to 5% positive rate). This motivates our choice of PR-AUC as a complementary metric to ROC-AUC. The roughly 19:1 ratio of non-burdened to burdened households is characteristic of many healthcare screening problems where the at-risk population is a small minority. A model that predicts "No" for everyone would achieve ~95% accuracy while being completely useless for the actual screening task.
+
+
+## 4. Recipe Specification
+
+The recipe defines the feature engineering pipeline applied consistently to every model. We deliberately specify the 17 predictor variables by name rather than using `high_burden ~ .` to avoid accidentally including survey design variables, raw MEPS codes, or the utilization variables reserved for the sensitivity analysis. This explicit specification also serves as documentation, since any reader of the code can immediately see exactly which variables enter the model.
+
+```{r base-recipe}
+#| label: base-recipe
+
+base_recipe <- recipe(
+  high_burden ~ AGE22X + EDUCYR + sex + race_eth + region + poverty +
+    insurance + health_phys + health_ment + diabetes + highbp + asthma +
+    arthritis + cancer + stroke + delayed_care + forgone_care,
+  data = fyc_train
+) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_ordinalscore(poverty, health_phys, health_ment) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+Each preprocessing step serves a specific purpose:
+
+1. **`step_novel()`** handles the possibility that the test set contains factor levels unseen during training by assigning them a dedicated "new" level.
+2. **`step_impute_median()` / `step_impute_mode()`** fill missing values using training-set statistics to prevent information leakage from the test set.
+3. **`step_ordinalscore()`** converts the three ordered factors (poverty, physical health, and mental health) into integer scores reflecting their ordinal ranking. This lets linear and tree-based models exploit the natural ordering.
+4. **`step_dummy()`** one-hot encodes the remaining unordered nominal predictors (sex, race/ethnicity, region, insurance, chronic condition indicators, and care access flags).
+5. **`step_zv()`** removes any zero-variance columns that may result from rare categories collapsing.
+6. **`step_normalize()`** centers and scales all numeric predictors. This is essential for regularized models (elastic net) and distance-based learners (SVM).
+
+::: {.callout-note}
+## Why Not SMOTE or Other Oversampling?
+While the EDA revealed severe class imbalance (~4 to 5% positive), we deliberately avoid synthetic oversampling for two reasons. First, SMOTE can create unrealistic synthetic observations in mixed numeric/categorical feature spaces. Second, our primary metrics (ROC-AUC and PR-AUC) evaluate the full ranking of predicted probabilities and are less sensitive to class imbalance than accuracy-based metrics. If threshold-dependent performance were critical, we would revisit this decision.
+:::
+
+We can verify the recipe by prepping it and examining the baked output dimensions.
+
+```{r verify-recipe}
+#| label: verify-recipe
+
+base_prep <- prep(base_recipe, training = fyc_train)
+base_baked <- bake(base_prep, new_data = NULL)
+
+cat("Baked training dimensions:", dim(base_baked), "\n")
+cat("Baked columns:\n")
+names(base_baked)
+```
+
+The baked output should contain the outcome plus all engineered features, with no survey design variables or raw MEPS codes present. The number of columns will exceed 18 due to dummy encoding of multi-level factors (e.g., `race_eth` with 5 levels produces 4 dummy columns) but should remain manageable for all six learners.
+
+
+## 5. Model Specifications
+
+We define six model specifications spanning a range of complexity from a fully interpretable baseline to flexible nonparametric learners. Each specification declares the model family, engine, and any hyperparameters marked for tuning. The choice of models is guided by complementary strengths:
+
+- **Logistic regression** provides interpretability and a performance floor
+- **Elastic net** adds regularization and automatic feature selection
+- **Random forest** captures interactions without manual specification
+- **XGBoost** provides state-of-the-art gradient boosting for tabular data
+- **SVM** offers a fundamentally different inductive bias based on margin maximization in a transformed feature space
+- **BART** provides a Bayesian nonparametric ensemble with built-in posterior uncertainty quantification
+
+### 5.1 Logistic Regression (Baseline)
+
+Logistic regression models the conditional probability of the positive class as
+
+$$
+P(Y = 1 \mid \mathbf{x}) = \sigma(\mathbf{x}^\top \boldsymbol{\beta}) = \frac{1}{1 + \exp(-\mathbf{x}^\top \boldsymbol{\beta})},
+$$
+
+where $\sigma(\cdot)$ is the logistic (sigmoid) function and $\boldsymbol{\beta} \in \mathbb{R}^p$ is the coefficient vector estimated by maximizing the log-likelihood $\ell(\boldsymbol{\beta}) = \sum_{i=1}^{n} \bigl[ y_i \log \hat{p}_i + (1 - y_i) \log(1 - \hat{p}_i) \bigr]$. With no hyperparameters to tune, logistic regression serves as an interpretable baseline whose coefficients yield direct odds-ratio estimates. Specifically, $\exp(\beta_j)$ gives the multiplicative change in odds of high financial burden for a one-unit increase in predictor $j$, holding all else constant.
+
+```{r spec-logistic}
+#| label: spec-logistic
+
+log_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+```
+
+### 5.2 Elastic Net Logistic Regression
+
+Elastic net augments the logistic regression log-likelihood with a combined L1/L2 penalty. The coefficient vector is estimated by minimizing
+
+$$
+-\frac{1}{n}\ell(\boldsymbol{\beta}) + \lambda \Bigl[ \alpha \|\boldsymbol{\beta}\|_1 + \frac{1 - \alpha}{2} \|\boldsymbol{\beta}\|_2^2 \Bigr],
+$$
+
+where $\lambda > 0$ controls overall regularization strength and $\alpha \in [0, 1]$ interpolates between pure ridge ($\alpha = 0$) and pure lasso ($\alpha = 1$). The L1 component drives coefficient shrinkage to exactly zero (automatic feature selection), while the L2 component stabilizes estimation for correlated predictors by distributing weight across them rather than selecting one arbitrarily.
+
+```{r spec-enet}
+#| label: spec-enet
+
+enet_spec <- logistic_reg(
+  penalty = tune(),
+  mixture = tune()
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+```
+
+### 5.3 Random Forest
+
+A random forest aggregates $B$ decision trees, each trained on a bootstrap sample $\mathcal{D}^{*b}$ drawn with replacement from the training data. The ensemble prediction is formed by majority vote (classification) or averaging (probability estimation):
+
+$$
+\hat{p}(\mathbf{x}) = \frac{1}{B} \sum_{b=1}^{B} \hat{p}_b(\mathbf{x}),
+$$
+
+where $\hat{p}_b$ is the class-probability estimate from the $b$-th tree. At each split within a tree, only a random subset of $m_{\text{try}} \leq p$ features is considered. This decorrelates the trees and reduces ensemble variance relative to bagging ($m_{\text{try}} = p$). The theoretical motivation is the variance reduction identity: for $B$ trees with pairwise correlation $\rho$ and individual variance $\sigma^2$, the ensemble variance is $\rho\sigma^2 + (1-\rho)\sigma^2/B$. Reducing $\rho$ via feature subsampling directly reduces prediction variance. We fix $B = 500$ and tune $m_{\text{try}}$ and the minimum node size $n_{\min}$.
+
+```{r spec-rf}
+#| label: spec-rf
+
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = 500
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+```
+
+### 5.4 XGBoost (Gradient-Boosted Trees)
+
+XGBoost implements gradient boosting by sequentially adding trees that approximate the negative gradient of the loss function. At iteration $t$, the model is updated as
+
+$$
+\hat{y}_i^{(t)} = \hat{y}_i^{(t-1)} + \eta \, f_t(\mathbf{x}_i),
+$$
+
+where $\eta \in (0, 1]$ is the learning rate (shrinkage parameter) and $f_t$ is a regression tree chosen to minimize the regularized objective
+
+$$
+\mathcal{L}^{(t)} = \sum_{i=1}^{n} \ell\bigl(y_i,\, \hat{y}_i^{(t-1)} + f_t(\mathbf{x}_i)\bigr) + \Omega(f_t), \quad \Omega(f_t) = \gamma T + \frac{1}{2}\lambda \sum_{j=1}^{T} w_j^2,
+$$
+
+where $T$ is the number of leaves, $w_j$ are the leaf weights, and $\gamma, \lambda$ are regularization parameters that penalize tree complexity. The second-order Taylor approximation of $\ell$ enables efficient split-finding using the gradient $g_i$ and Hessian $h_i$ of the loss at each observation. We fix $B = 750$ boosting rounds and tune tree depth, $\eta$, and minimum node size.
+
+```{r spec-xgb}
+#| label: spec-xgb
+
+xgb_spec <- boost_tree(
+  trees      = 750,
+  tree_depth = tune(),
+  learn_rate = tune(),
+  min_n      = tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+### 5.5 SVM (Radial Basis Function Kernel)
+
+The support vector machine with radial basis function (RBF) kernel solves the optimization problem
+
+$$
+\min_{\mathbf{w}, b, \boldsymbol{\xi}} \; \frac{1}{2}\|\mathbf{w}\|^2 + C \sum_{i=1}^{n} \xi_i \quad \text{s.t.} \quad y_i(\mathbf{w}^\top \phi(\mathbf{x}_i) + b) \geq 1 - \xi_i, \;\; \xi_i \geq 0,
+$$
+
+where $\phi(\cdot)$ is the (implicit) feature map induced by the RBF kernel $K(\mathbf{x}, \mathbf{x}') = \exp(-\sigma\|\mathbf{x} - \mathbf{x}'\|^2)$. The cost parameter $C$ controls the trade-off between maximizing the margin (low complexity, high bias) and minimizing training errors (high complexity, low bias). Meanwhile, $\sigma$ governs the kernel bandwidth: small $\sigma$ yields highly local decision boundaries (low bias, high variance) and large $\sigma$ yields smoother, more global boundaries (high bias, low variance). By the kernel trick, the dual formulation avoids explicit computation in the (potentially infinite-dimensional) feature space $\phi(\cdot)$.
+
+```{r spec-svm}
+#| label: spec-svm
+
+svm_spec <- svm_rbf(
+  cost      = tune(),
+  rbf_sigma = tune()
+) %>%
+  set_engine("kernlab") %>%
+  set_mode("classification")
+```
+
+### 5.6 BART (Bayesian Additive Regression Trees)
+
+Bayesian Additive Regression Trees (BART) represent a fundamentally different approach to ensemble learning. Rather than sequentially optimizing trees (as in XGBoost), BART places a regularization prior over a sum of regression trees and uses Markov Chain Monte Carlo (MCMC) sampling to explore the posterior distribution. The model takes the form
+
+$$
+f(\mathbf{x}) = \sum_{j=1}^{m} g_j(\mathbf{x}; T_j, M_j),
+$$
+
+where each $g_j$ is a regression tree with structure $T_j$ and leaf parameters $M_j$. The prior over $(T_j, M_j)$ regularizes in two ways: (1) favoring shallow trees via a depth-dependent splitting probability $\alpha(1 + d)^{-\beta}$, and (2) shrinking leaf predictions toward zero via a conjugate normal prior on $M_j$. This "sum-of-weak-learners" structure with Bayesian regularization produces automatic smoothing that naturally guards against overfitting without requiring careful tuning of learning rates or early stopping criteria.
+
+A key advantage of BART is that the MCMC posterior provides a **full predictive distribution** for each observation, enabling principled uncertainty quantification without bootstrapping. We tune the number of trees, the terminal node prior coefficient $\alpha$, and the terminal node prior exponent $\beta$.
+
+> Chipman, H. A., George, E. I., & McCulloch, R. E. (2010). BART: Bayesian additive regression trees. *The Annals of Applied Statistics*, 4(1), 266-298.
+
+```{r spec-bart}
+#| label: spec-bart
+
+bart_spec <- bart(
+  trees = tune(),
+  prior_terminal_node_coef = tune(),
+  prior_terminal_node_expo = tune()
+) %>%
+  set_engine("dbarts") %>%
+  set_mode("classification")
+```
+
+
+## 6. Workflow Assembly
+
+A `workflow` object in tidymodels bundles a recipe and a model specification into a single unit that can be fit, tuned, and evaluated. This ensures that the same preprocessing is applied consistently during cross-validation and final evaluation.
+
+```{r workflows}
+#| label: workflows
+
+log_wf <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(log_spec)
+
+enet_wf <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(enet_spec)
+
+rf_wf <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(rf_spec)
+
+xgb_wf <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(xgb_spec)
+
+svm_wf <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(svm_spec)
+
+bart_wf <- workflow() %>%
+  add_recipe(base_recipe) %>%
+  add_model(bart_spec)
+```
+
+Each workflow pairs the same `base_recipe` with a different model specification. This modular design makes it straightforward to swap in alternative recipes (e.g. the extended recipe in Section 10) or model specs without rewriting the entire pipeline.
+
+We deliberately do not create interaction terms or polynomial features in the recipe. Tree-based models (random forest and XGBoost) can discover interactions natively through recursive partitioning, and the elastic net and SVM operate in feature spaces rich enough to capture nonlinearities on their own. Adding explicit interaction terms would inflate the feature space and increase the risk of overfitting in the linear models without meaningfully helping the tree-based learners.
+
+
+## 7. Model Tuning
+
+We evaluate all models using 10-fold stratified cross-validation with two complementary metrics. **ROC-AUC** (area under the receiver operating characteristic curve) summarizes discrimination across all classification thresholds. It is invariant to class prevalence and has a natural probabilistic interpretation: the probability that a randomly chosen positive example is scored higher than a randomly chosen negative example. **PR-AUC** (area under the precision-recall curve) is more sensitive to performance on the minority class and is especially relevant here since identifying financially burdened households is our core objective. Together, these two metrics give us a comprehensive picture of model quality.
+
+We save intermediate tuning results to disk so that expensive fits (especially XGBoost, which evaluates 64 configurations each requiring 10 CV folds) do not need to be repeated across rendering sessions. The `save_pred = TRUE` control option also stores out-of-fold predictions, which we need for constructing ROC and PR curves during comparison.
+
+```{r tuning-setup}
+#| label: tuning-setup
+
+burden_metrics <- metric_set(roc_auc, pr_auc)
+
+ctrl <- control_grid(save_pred = TRUE, verbose = FALSE)
+```
+
+### 7.1 Logistic Regression
+
+The logistic regression baseline has no hyperparameters to tune so we simply evaluate its CV performance using `fit_resamples()`.
+
+```{r tune-logistic}
+#| label: tune-logistic
+
+if (file.exists("data/log_fit.RData")) {
+  load("data/log_fit.RData")
+} else {
+  log_fit <- log_wf %>%
+    fit_resamples(
+      resamples = cv_folds,
+      metrics   = burden_metrics,
+      control   = ctrl
+    )
+  save(log_fit, file = "data/log_fit.RData")
+}
+
+collect_metrics(log_fit) %>%
+  gt() %>%
+  tab_header(title = "Logistic Regression: Cross-Validation Performance") %>%
+  fmt_number(columns = c(mean, std_err), decimals = 4)
+```
+
+The logistic regression baseline provides a reference point for all subsequent models. Its performance reflects what is achievable with a linear decision boundary and no regularization. Even if more complex models outperform it, the logistic regression coefficients remain valuable for interpretability because they provide direct odds-ratio estimates for each predictor's marginal association with financial toxicity.
+
+### 7.2 Elastic Net
+
+We search a regular grid over penalty (log-scale from $10^{-4}$ to $10^{0}$) and mixture (0 to 1). This yields 60 candidate configurations spanning from nearly unpenalized logistic regression to aggressive lasso shrinkage.
+
+```{r tune-enet}
+#| label: tune-enet
+
+enet_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  mixture(range = c(0, 1)),
+  levels = c(10, 6)
+)
+
+if (file.exists("data/enet_tune.RData")) {
+  load("data/enet_tune.RData")
+} else {
+  enet_tune <- enet_wf %>%
+    tune_grid(
+      resamples = cv_folds,
+      grid      = enet_grid,
+      metrics   = burden_metrics,
+      control   = ctrl
+    )
+  save(enet_tune, file = "data/enet_tune.RData")
+}
+```
+
+```{r enet-autoplot}
+#| label: enet-autoplot
+
+autoplot(enet_tune) +
+  labs(title = "Elastic Net: Tuning Performance Across Penalty and Mixture")
+```
+
+```{r enet-best}
+#| label: enet-best
+
+show_best(enet_tune, metric = "roc_auc", n = 5) %>%
+  gt() %>%
+  tab_header(title = "Elastic Net: Top 5 Configurations by ROC-AUC") %>%
+  fmt_number(columns = c(mean, std_err), decimals = 4)
+```
+
+The tuning surface reveals the interplay between regularization strength and the L1/L2 balance. Moderate penalty values with a mixture near 0.5 (blending lasso and ridge) tend to perform best, suggesting that some feature selection is beneficial but pure lasso is too aggressive for this predictor set. The elastic net's ability to shrink less-informative predictors toward zero while retaining correlated predictors (via the ridge component) is especially useful here, where several chronic condition indicators may carry partially redundant information.
+
+### 7.3 Random Forest
+
+We tune the number of features considered at each split (`mtry`) and the minimum node size (`min_n`). The grid spans `mtry` from 3 to 15 (out of about 24 features after dummy encoding) and `min_n` from 5 to 30.
+
+```{r tune-rf}
+#| label: tune-rf
+
+rf_grid <- grid_regular(
+  mtry(range = c(3, 15)),
+  min_n(range = c(5, 30)),
+  levels = 5
+)
+
+if (file.exists("data/rf_tune.RData")) {
+  load("data/rf_tune.RData")
+} else {
+  rf_tune <- rf_wf %>%
+    tune_grid(
+      resamples = cv_folds,
+      grid      = rf_grid,
+      metrics   = burden_metrics,
+      control   = ctrl
+    )
+  save(rf_tune, file = "data/rf_tune.RData")
+}
+```
+
+```{r rf-autoplot}
+#| label: rf-autoplot
+
+autoplot(rf_tune) +
+  labs(title = "Random Forest: Tuning Performance Across mtry and min_n")
+```
+
+```{r rf-best}
+#| label: rf-best
+
+show_best(rf_tune, metric = "roc_auc", n = 5) %>%
+  gt() %>%
+  tab_header(title = "Random Forest: Top 5 Configurations by ROC-AUC") %>%
+  fmt_number(columns = c(mean, std_err), decimals = 4)
+```
+
+Random forest performance is relatively stable across the tuning grid, which is characteristic of ensembles that are robust to hyperparameter choices. Moderate `mtry` values (around the square root of the number of features) tend to perform well, consistent with theoretical recommendations. The `min_n` parameter acts as a regularizer: larger values prevent the trees from growing to pure leaves, which can reduce overfitting at the cost of some flexibility. For this dataset, we expect moderate `min_n` values to strike the best balance given the relatively large sample size.
+
+### 7.4 XGBoost
+
+XGBoost has the richest hyperparameter space. We tune tree depth (3 to 8), learning rate ($10^{-2}$ to $10^{-0.5} \approx 0.32$), and minimum node size (5 to 30) over a 64-point regular grid. This is the most computationally intensive tuning step, requiring $64 \times 10 = 640$ individual model fits.
+
+```{r tune-xgb}
+#| label: tune-xgb
+
+xgb_grid <- grid_regular(
+  tree_depth(range = c(3, 8)),
+  learn_rate(range = c(-2, -0.5)),
+  min_n(range = c(5, 30)),
+  levels = 4
+)
+
+if (file.exists("data/xgb_tune.RData")) {
+  load("data/xgb_tune.RData")
+} else {
+  xgb_tune <- xgb_wf %>%
+    tune_grid(
+      resamples = cv_folds,
+      grid      = xgb_grid,
+      metrics   = burden_metrics,
+      control   = ctrl
+    )
+  save(xgb_tune, file = "data/xgb_tune.RData")
+}
+```
+
+```{r xgb-autoplot}
+#| label: xgb-autoplot
+
+autoplot(xgb_tune) +
+  labs(title = "XGBoost: Tuning Performance Across Hyperparameters")
+```
+
+```{r xgb-best}
+#| label: xgb-best
+
+show_best(xgb_tune, metric = "roc_auc", n = 5) %>%
+  gt() %>%
+  tab_header(title = "XGBoost: Top 5 Configurations by ROC-AUC") %>%
+  fmt_number(columns = c(mean, std_err), decimals = 4)
+```
+
+The XGBoost tuning surface illustrates the trade-off between model complexity and generalization. Deeper trees risk overfitting, while very shallow trees may underfit the complex interactions between poverty, insurance type, and chronic conditions identified in the EDA. The learning rate and number of trees interact strongly: a lower learning rate requires more boosting rounds to achieve the same effective model complexity, but the resulting ensemble tends to generalize better. We fixed trees at 750 as a reasonable budget and let the learning rate adapt accordingly.
+
+### 7.5 SVM (Radial Basis Function)
+
+We tune the cost parameter ($10^{-2}$ to $10^{2}$) and kernel bandwidth ($10^{-3}$ to
+$10^{0}$) over a 25-point grid.
+
+```{r tune-svm}
+#| label: tune-svm
+
+svm_grid <- grid_regular(
+  cost(range = c(-2, 2)),
+  rbf_sigma(range = c(-3, 0)),
+  levels = 5
+)
+
+if (file.exists("data/svm_tune.RData")) {
+  load("data/svm_tune.RData")
+} else {
+  svm_tune <- svm_wf %>%
+    tune_grid(
+      resamples = cv_folds,
+      grid      = svm_grid,
+      metrics   = burden_metrics,
+      control   = ctrl
+    )
+  save(svm_tune, file = "data/svm_tune.RData")
+}
+```
+
+```{r svm-autoplot}
+#| label: svm-autoplot
+
+autoplot(svm_tune) +
+  labs(title = "SVM RBF: Tuning Performance Across Cost and Sigma")
+```
+
+```{r svm-best}
+#| label: svm-best
+
+show_best(svm_tune, metric = "roc_auc", n = 5) %>%
+  gt() %>%
+  tab_header(title = "SVM RBF: Top 5 Configurations by ROC-AUC") %>%
+  fmt_number(columns = c(mean, std_err), decimals = 4)
+```
+
+The SVM tuning surface reveals the characteristic sensitivity of kernel methods to the cost-sigma trade-off. Higher cost values reduce training error but risk overfitting. The sigma parameter controls the locality of the kernel: too small produces overly complex boundaries that memorize training data, and too large yields near-linear separation that fails to capture nonlinear patterns. Unlike tree-based models, SVMs lack native variable importance measures, which makes them less interpretable for this application.
+
+### 7.6 BART
+
+We tune three BART-specific hyperparameters over a $3 \times 3 \times 3 = 27$-point regular grid: the number of trees (50 to 200), the terminal node prior coefficient $\alpha$ (0.5 to 0.95), and the terminal node prior exponent $\beta$ (1 to 3). BART's MCMC-based fitting is slower than frequentist alternatives, but the regularization prior reduces sensitivity to hyperparameter choices, making a coarser grid acceptable.
+
+```{r tune-bart}
+#| label: tune-bart
+
+bart_grid <- grid_regular(
+  trees(range = c(50, 200)),
+  prior_terminal_node_coef(range = c(0.5, 0.95)),
+  prior_terminal_node_expo(range = c(1, 3)),
+  levels = 3
+)
+
+if (file.exists("data/bart_tune.RData")) {
+  load("data/bart_tune.RData")
+} else {
+  bart_tune <- bart_wf %>%
+    tune_grid(
+      resamples = cv_folds,
+      grid      = bart_grid,
+      metrics   = burden_metrics,
+      control   = ctrl
+    )
+  save(bart_tune, file = "data/bart_tune.RData")
+}
+```
+
+```{r bart-autoplot}
+#| label: bart-autoplot
+
+autoplot(bart_tune) +
+  labs(title = "BART: Tuning Performance Across Hyperparameters")
+```
+
+```{r bart-best}
+#| label: bart-best
+
+show_best(bart_tune, metric = "roc_auc", n = 5) %>%
+  gt() %>%
+  tab_header(title = "BART: Top 5 Configurations by ROC-AUC") %>%
+  fmt_number(columns = c(mean, std_err), decimals = 4)
+```
+
+BART's performance reflects the Bayesian regularization mechanism. The prior over tree structures prevents individual trees from growing too deep, and the sum-of-trees decomposition encourages each tree to contribute a small correction rather than fitting the full signal. This automatic regularization means BART is relatively robust to hyperparameter choices compared to XGBoost, where the interplay between learning rate, tree depth, and number of rounds requires careful calibration.
+
+
+## 8. Model Comparison
+
+With all six models tuned (or evaluated via resamples), we can now compare their cross-validation performance side by side. This comparison spans 202 total hyperparameter configurations (1 logistic + 60 elastic net + 25 random forest + 64 XGBoost + 25 SVM + 27 BART), each evaluated over 10 folds for a total of 2,020 individual model fits. We extract the single best configuration from each model (by ROC-AUC) and present them in a unified table and visualization.
+
+```{r model-comparison}
+#| label: model-comparison
+
+log_best <- collect_metrics(log_fit) %>%
+  mutate(model = "Logistic Regression")
+enet_best_params <- select_best(enet_tune, metric = "roc_auc")
+enet_best <- collect_metrics(enet_tune) %>%
+  inner_join(enet_best_params, by = names(enet_best_params)[!names(enet_best_params) %in% ".config"]) %>%
+  mutate(model = "Elastic Net")
+
+rf_best_params <- select_best(rf_tune, metric = "roc_auc")
+rf_best <- collect_metrics(rf_tune) %>%
+  inner_join(rf_best_params, by = names(rf_best_params)[!names(rf_best_params) %in% ".config"]) %>%
+  mutate(model = "Random Forest")
+
+xgb_best_params <- select_best(xgb_tune, metric = "roc_auc")
+xgb_best <- collect_metrics(xgb_tune) %>%
+  inner_join(xgb_best_params, by = names(xgb_best_params)[!names(xgb_best_params) %in% ".config"]) %>%
+  mutate(model = "XGBoost")
+
+svm_best_params <- select_best(svm_tune, metric = "roc_auc")
+svm_best <- collect_metrics(svm_tune) %>%
+  inner_join(svm_best_params, by = names(svm_best_params)[!names(svm_best_params) %in% ".config"]) %>%
+  mutate(model = "SVM RBF")
+
+bart_best_params <- select_best(bart_tune, metric = "roc_auc")
+bart_best <- collect_metrics(bart_tune) %>%
+  inner_join(bart_best_params, by = names(bart_best_params)[!names(bart_best_params) %in% ".config"]) %>%
+  mutate(model = "BART")
+
+model_comparison <- bind_rows(
+  log_best, enet_best, rf_best, xgb_best, svm_best, bart_best
+) %>%
+  select(model, .metric, mean, std_err) %>%
+  arrange(.metric, desc(mean))
+```
+
+```{r comparison-table}
+#| label: comparison-table
+
+model_comparison %>%
+  pivot_wider(
+    names_from  = .metric,
+    values_from = c(mean, std_err),
+    names_glue  = "{.metric}_{.value}"
+  ) %>%
+  arrange(desc(roc_auc_mean)) %>%
+  gt() %>%
+  tab_header(
+    title    = "Cross-Validation Model Comparison",
+    subtitle = "Ranked by ROC-AUC (10-fold stratified CV)"
+  ) %>%
+  fmt_number(columns = where(is.numeric), decimals = 4) %>%
+  cols_label(
+    model         = "Model",
+    roc_auc_mean  = "ROC-AUC (Mean)",
+    roc_auc_std_err = "ROC-AUC (SE)",
+    pr_auc_mean   = "PR-AUC (Mean)",
+    pr_auc_std_err  = "PR-AUC (SE)"
+  )
+```
+
+```{r comparison-plot}
+#| label: comparison-plot
+#| fig-height: 5
+
+model_comparison %>%
+  mutate(
+    model = fct_reorder(model, mean, .fun = max),
+    lower = mean - std_err,
+    upper = mean + std_err
+  ) %>%
+  ggplot(aes(x = mean, y = model, color = .metric)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(
+    aes(xmin = lower, xmax = upper),
+    height = 0.2,
+    position = position_dodge(width = 0.4)
+  ) +
+  scale_color_manual(
+    values = c("roc_auc" = clr_blue, "pr_auc" = clr_red),
+    labels = c("ROC-AUC", "PR-AUC")
+  ) +
+  labs(
+    title = "Cross-Validation Performance Comparison",
+    x     = "Metric Value (Mean +/- SE)",
+    y     = NULL,
+    color = "Metric"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+The comparison reveals the performance hierarchy across the six models. The ranking reflects how well each learner captures the nonlinear interactions between poverty level, insurance type, and chronic condition burden that we identified during EDA. Tree-based ensembles capture complex interactions natively, while elastic net exploits regularization to handle the moderate-dimensional feature space efficiently. The SVM provides a complementary kernel-based perspective, and BART adds a Bayesian nonparametric perspective with posterior-based uncertainty quantification.
+
+The performance hierarchy can be understood through the **bias-variance tradeoff**. Logistic regression and elastic net impose a linear decision boundary in the feature space, which limits their capacity to capture nonlinear interactions between predictors (higher bias) but produces stable predictions across different training samples (lower variance). The elastic net's regularization further reduces variance by shrinking coefficients at the cost of introducing additional bias. In contrast, random forest and XGBoost employ ensembles of decision trees that can approximate arbitrarily complex decision boundaries (lower bias), with variance controlled by averaging over many decorrelated trees (RF) or by the learning rate shrinkage and regularization penalties (XGBoost). The SVM-RBF occupies a middle ground: the kernel bandwidth $\sigma$ and cost parameter $C$ jointly govern the bias-variance tradeoff. Small $\sigma$ and large $C$ yield complex, locally adaptive boundaries (low bias, high variance), while large $\sigma$ and small $C$ produce smoother boundaries (high bias, low variance). The cross-validation standard errors in the table above reflect this structure, and we expect tree-based ensembles to exhibit slightly higher fold-to-fold variability than the linear models, consistent with their greater flexibility.
+
+It is worth noting that the gap between ROC-AUC and PR-AUC across models reflects the class imbalance. PR-AUC is typically lower because it does not give credit for correctly classifying the majority (non-burdened) class. Models with higher PR-AUC are better at identifying the minority class, precisely the households most in need of intervention. When selecting the final model, we prioritize ROC-AUC as the primary metric but also consider PR-AUC to ensure the model is not merely discriminating within the majority class.
+
+Based on the cross-validation results, we select the **best-performing model** (by ROC-AUC) for test set evaluation. If two models are within one standard error of each other, we prefer the simpler or more interpretable model.
+
+```{r select-best-model}
+#| label: select-best-model
+
+best_cv_summary <- model_comparison %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean))
+
+cat("Best model by CV ROC-AUC:", best_cv_summary$model[1], "\n")
+cat("ROC-AUC:", round(best_cv_summary$mean[1], 4),
+    "+/-", round(best_cv_summary$std_err[1], 4), "\n")
+```
+
+### All-Models ROC Curve Overlay
+
+To visualize the discriminative performance of all six models simultaneously we overlay their out-of-fold ROC curves from cross-validation. Each curve is constructed from the held-out predictions of the best hyperparameter configuration for that model.
+
+```{r all-models-roc}
+#| label: all-models-roc
+#| fig-height: 6
+
+all_roc_data <- bind_rows(
+  collect_predictions(log_fit) %>%
+    roc_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "Logistic Regression"),
+
+  collect_predictions(enet_tune) %>%
+    filter(.config == select_best(enet_tune, metric = "roc_auc")$.config) %>%
+    roc_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "Elastic Net"),
+
+  collect_predictions(rf_tune) %>%
+    filter(.config == select_best(rf_tune, metric = "roc_auc")$.config) %>%
+    roc_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "Random Forest"),
+
+  collect_predictions(xgb_tune) %>%
+    filter(.config == select_best(xgb_tune, metric = "roc_auc")$.config) %>%
+    roc_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "XGBoost"),
+
+  collect_predictions(svm_tune) %>%
+    filter(.config == select_best(svm_tune, metric = "roc_auc")$.config) %>%
+    roc_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "SVM RBF"),
+
+  collect_predictions(bart_tune) %>%
+    filter(.config == select_best(bart_tune, metric = "roc_auc")$.config) %>%
+    roc_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "BART")
+)
+
+auc_labels <- best_cv_summary %>%
+  mutate(label = paste0(model, " (", sprintf("%.3f", mean), ")"))
+
+all_roc_data <- all_roc_data %>%
+  mutate(model = factor(model, levels = auc_labels$model))
+
+ggplot(all_roc_data, aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_path(linewidth = 0.8) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  scale_color_brewer(palette = "Set2", labels = auc_labels$label) +
+  labs(
+    title = "ROC Curves: All Models (CV Out-of-Fold Predictions)",
+    x     = "1 - Specificity (FPR)",
+    y     = "Sensitivity (TPR)",
+    color = "Model (ROC-AUC)"
+  ) +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(nrow = 2))
+```
+
+### All-Models Precision-Recall Overlay
+
+```{r all-models-pr}
+#| label: all-models-pr
+#| fig-height: 6
+
+all_pr_data <- bind_rows(
+  collect_predictions(log_fit) %>%
+    pr_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "Logistic Regression"),
+
+  collect_predictions(enet_tune) %>%
+    filter(.config == select_best(enet_tune, metric = "roc_auc")$.config) %>%
+    pr_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "Elastic Net"),
+
+  collect_predictions(rf_tune) %>%
+    filter(.config == select_best(rf_tune, metric = "roc_auc")$.config) %>%
+    pr_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "Random Forest"),
+
+  collect_predictions(xgb_tune) %>%
+    filter(.config == select_best(xgb_tune, metric = "roc_auc")$.config) %>%
+    pr_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "XGBoost"),
+
+  collect_predictions(svm_tune) %>%
+    filter(.config == select_best(svm_tune, metric = "roc_auc")$.config) %>%
+    pr_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "SVM RBF"),
+
+  collect_predictions(bart_tune) %>%
+    filter(.config == select_best(bart_tune, metric = "roc_auc")$.config) %>%
+    pr_curve(truth = high_burden, .pred_Yes) %>%
+    mutate(model = "BART")
+)
+
+pr_auc_summary <- model_comparison %>%
+  filter(.metric == "pr_auc") %>%
+  arrange(desc(mean)) %>%
+  mutate(label = paste0(model, " (", sprintf("%.3f", mean), ")"))
+
+all_pr_data <- all_pr_data %>%
+  mutate(model = factor(model, levels = pr_auc_summary$model))
+
+prevalence_cv <- mean(fyc_train$high_burden == "Yes")
+
+ggplot(all_pr_data, aes(x = recall, y = precision, color = model)) +
+  geom_path(linewidth = 0.8) +
+  geom_hline(yintercept = prevalence_cv, linetype = "dashed", color = "grey50") +
+  scale_color_brewer(palette = "Set2", labels = pr_auc_summary$label) +
+  labs(
+    title = "Precision-Recall Curves: All Models (CV Out-of-Fold Predictions)",
+    x     = "Recall",
+    y     = "Precision",
+    color = "Model (PR-AUC)"
+  ) +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(nrow = 2))
+```
+
+
+## 9. Test Set Evaluation
+
+Now we finalize the best model by selecting its optimal hyperparameters and fitting it on the full training set, then evaluate on the held-out test set to get an unbiased estimate of generalization performance. We refit the finalized workflow on the entire training set using `fit()` and generate predictions on the held-out test set using `predict()`. We use this manual approach (rather than `last_fit()`) to avoid compatibility issues arising from the factor-level modifications applied after the initial data split.
+
+```{r finalize-workflow}
+#| label: finalize-workflow
+
+best_model_name <- best_cv_summary$model[1]
+
+if (best_model_name == "XGBoost") {
+  best_params <- select_best(xgb_tune, metric = "roc_auc")
+  final_wf    <- finalize_workflow(xgb_wf, best_params)
+} else if (best_model_name == "Random Forest") {
+  best_params <- select_best(rf_tune, metric = "roc_auc")
+  final_wf    <- finalize_workflow(rf_wf, best_params)
+} else if (best_model_name == "Elastic Net") {
+  best_params <- select_best(enet_tune, metric = "roc_auc")
+  final_wf    <- finalize_workflow(enet_wf, best_params)
+} else if (best_model_name == "SVM RBF") {
+  best_params <- select_best(svm_tune, metric = "roc_auc")
+  final_wf    <- finalize_workflow(svm_wf, best_params)
+} else if (best_model_name == "BART") {
+  best_params <- select_best(bart_tune, metric = "roc_auc")
+  final_wf    <- finalize_workflow(bart_wf, best_params)
+} else {
+  final_wf <- log_wf
+}
+
+cat("Finalized workflow for:", best_model_name, "\n")
+```
+
+```{r last-fit}
+#| label: last-fit
+
+final_fitted <- fit(final_wf, data = fyc_train)
+
+test_preds <- augment(final_fitted, new_data = fyc_test)
+
+test_roc_val <- roc_auc(test_preds, truth = high_burden, .pred_Yes) %>% pull(.estimate)
+test_pr_val  <- pr_auc(test_preds, truth = high_burden, .pred_Yes) %>% pull(.estimate)
+
+test_metrics <- tibble(
+  Metric = c("ROC-AUC", "PR-AUC"),
+  Estimate = c(test_roc_val, test_pr_val)
+)
+
+test_metrics %>%
+  gt() %>%
+  tab_header(title = paste("Test Set Performance:", best_model_name)) %>%
+  fmt_number(columns = Estimate, decimals = 4)
+```
+
+::: {.callout-note}
+## Interpreting Test Performance
+A model that achieves similar ROC-AUC on the test set as in cross-validation is not overfit to the training data. Substantial degradation would suggest the model has memorized training-set-specific patterns. PR-AUC is particularly informative here because it weights performance on the minority (high burden) class more heavily.
+:::
+
+### 9.1 ROC Curve
+
+```{r roc-curve}
+#| label: roc-curve
+
+test_roc <- test_preds %>%
+  roc_curve(truth = high_burden, .pred_Yes)
+
+test_roc_auc <- round(test_roc_val, 4)
+
+autoplot(test_roc) +
+  annotate(
+    "text", x = 0.6, y = 0.3,
+    label = paste0("AUC = ", test_roc_auc),
+    size = 5, fontface = "bold", color = clr_blue
+  ) +
+  labs(
+    title = paste("ROC Curve:", best_model_name, "(Test Set)"),
+    subtitle = "Dashed line represents random classifier"
+  ) +
+  geom_abline(lty = 2, color = "grey50")
+```
+
+### 9.2 Precision-Recall Curve
+
+```{r pr-curve}
+#| label: pr-curve
+
+test_pr <- test_preds %>%
+  pr_curve(truth = high_burden, .pred_Yes)
+
+prevalence <- mean(fyc_test$high_burden == "Yes")
+
+test_pr_auc <- round(test_pr_val, 4)
+
+autoplot(test_pr) +
+  geom_hline(
+    yintercept = prevalence, lty = 2, color = clr_red,
+    linewidth = 0.8
+  ) +
+  annotate(
+    "text", x = 0.5, y = prevalence + 0.03,
+    label = paste0("Baseline prevalence = ", round(prevalence, 3)),
+    size = 4, color = clr_red
+  ) +
+  annotate(
+    "text", x = 0.3, y = 0.8,
+    label = paste0("PR-AUC = ", test_pr_auc),
+    size = 5, fontface = "bold", color = clr_blue
+  ) +
+  labs(
+    title = paste("Precision-Recall Curve:", best_model_name, "(Test Set)"),
+    subtitle = "Dashed line represents prevalence (no-skill baseline)"
+  )
+```
+
+### 9.3 Confusion Matrix
+
+```{r confusion-matrix}
+#| label: confusion-matrix
+
+test_preds %>%
+  conf_mat(truth = high_burden, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title = paste("Confusion Matrix:", best_model_name, "(Test Set)"))
+```
+
+The confusion matrix at the default 0.50 probability threshold reveals the trade-off between sensitivity and specificity. Given the severe class imbalance (~4 to 5% positive), the default threshold may not be optimal. It tends to favor specificity (correctly classifying non-burdened households) at the expense of sensitivity (detecting burdened households).
+
+In a clinical or policy deployment context, false negatives (failing to identify households at risk of financial toxicity) carry greater cost than false positives. A false alarm merely triggers an unnecessary financial counseling referral, while a missed case may lead to delayed care, medical debt, or bankruptcy. To address this, we systematically evaluate performance across the full range of classification thresholds below.
+
+#### Threshold Optimization
+
+The default 0.50 threshold is poorly suited to this problem. With only ~5% prevalence, most observations receive predicted probabilities well below 0.50, so the model rarely predicts "Yes" at the default cutoff. We sweep thresholds from 0.05 to 0.80 and compute sensitivity (recall), specificity, precision, and the F1 score at each. Youden's J statistic ($J = \text{sensitivity} + \text{specificity} - 1$) identifies the threshold that maximizes the combined ability to detect both classes, while F1 balances precision and recall for the minority class specifically.
+
+```{r threshold-sweep}
+#| label: threshold-sweep
+#| fig-height: 6
+
+thresholds <- seq(0.05, 0.80, by = 0.01)
+
+threshold_metrics <- map_dfr(thresholds, function(thr) {
+  preds_at_thr <- test_preds %>%
+    mutate(.pred_class_thr = factor(ifelse(.pred_Yes >= thr, "Yes", "No"),
+                                     levels = c("Yes", "No")))
+
+  tp <- sum(preds_at_thr$high_burden == "Yes" & preds_at_thr$.pred_class_thr == "Yes")
+  fp <- sum(preds_at_thr$high_burden == "No"  & preds_at_thr$.pred_class_thr == "Yes")
+  fn <- sum(preds_at_thr$high_burden == "Yes" & preds_at_thr$.pred_class_thr == "No")
+  tn <- sum(preds_at_thr$high_burden == "No"  & preds_at_thr$.pred_class_thr == "No")
+
+  sens <- tp / (tp + fn)
+  spec <- tn / (tn + fp)
+  prec <- ifelse(tp + fp == 0, NA_real_, tp / (tp + fp))
+  f1   <- ifelse(is.na(prec) | (prec + sens) == 0, NA_real_,
+                 2 * prec * sens / (prec + sens))
+  j    <- sens + spec - 1
+
+  tibble(threshold = thr, sensitivity = sens, specificity = spec,
+         precision = prec, f1 = f1, youden_j = j)
+})
+
+best_j   <- threshold_metrics %>% filter(youden_j == max(youden_j, na.rm = TRUE)) %>% slice(1)
+best_f1  <- threshold_metrics %>% filter(f1 == max(f1, na.rm = TRUE)) %>% slice(1)
+
+threshold_long <- threshold_metrics %>%
+  pivot_longer(c(sensitivity, specificity, precision, f1),
+               names_to = "metric", values_to = "value") %>%
+  mutate(metric = case_match(metric,
+    "sensitivity" ~ "Sensitivity (Recall)",
+    "specificity" ~ "Specificity",
+    "precision"   ~ "Precision",
+    "f1"          ~ "F1 Score"
+  ))
+
+ggplot(threshold_long, aes(x = threshold, y = value, color = metric)) +
+  geom_line(linewidth = 1) +
+  geom_vline(xintercept = 0.50, linetype = "dashed", color = "grey50", linewidth = 0.6) +
+  geom_vline(xintercept = best_j$threshold, linetype = "dotted",
+             color = clr_green, linewidth = 0.8) +
+  geom_vline(xintercept = best_f1$threshold, linetype = "dotted",
+             color = clr_gold, linewidth = 0.8) +
+  annotate("text", x = 0.50, y = 0.05, label = "Default (0.50)",
+           hjust = -0.1, size = 3, color = "grey40") +
+  annotate("text", x = best_j$threshold, y = 0.02,
+           label = paste0("Youden's J (", best_j$threshold, ")"),
+           hjust = -0.1, size = 3, color = clr_green) +
+  annotate("text", x = best_f1$threshold, y = 0.10,
+           label = paste0("Best F1 (", best_f1$threshold, ")"),
+           hjust = -0.1, size = 3, color = clr_gold) +
+  scale_color_manual(values = c(
+    "Sensitivity (Recall)" = clr_red,
+    "Specificity"          = clr_blue,
+    "Precision"            = clr_gold,
+    "F1 Score"             = clr_green
+  )) +
+  labs(
+    x     = "Classification Threshold",
+    y     = "Metric Value",
+    color = NULL,
+    title = paste("Threshold Analysis:", best_model_name),
+    subtitle = "Vertical lines mark default (0.50), Youden's J optimum, and best F1"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+```{r threshold-table}
+#| label: threshold-table
+
+tibble(
+  Criterion     = c("Default (0.50)", "Youden's J", "Best F1"),
+  Threshold     = c(0.50, best_j$threshold, best_f1$threshold),
+  Sensitivity   = c(
+    threshold_metrics$sensitivity[threshold_metrics$threshold == 0.50],
+    best_j$sensitivity, best_f1$sensitivity
+  ),
+  Specificity   = c(
+    threshold_metrics$specificity[threshold_metrics$threshold == 0.50],
+    best_j$specificity, best_f1$specificity
+  ),
+  Precision     = c(
+    threshold_metrics$precision[threshold_metrics$threshold == 0.50],
+    best_j$precision, best_f1$precision
+  ),
+  F1            = c(
+    threshold_metrics$f1[threshold_metrics$threshold == 0.50],
+    best_j$f1, best_f1$f1
+  )
+) %>%
+  gt() %>%
+  tab_header(
+    title    = "Threshold Comparison: Default vs. Optimized",
+    subtitle = paste("Model:", best_model_name)
+  ) %>%
+  fmt_number(columns = c(Threshold, Sensitivity, Specificity, Precision, F1), decimals = 3)
+```
+
+```{r confusion-optimized}
+#| label: confusion-optimized
+
+test_preds_opt <- test_preds %>%
+  mutate(.pred_class_opt = factor(ifelse(.pred_Yes >= best_j$threshold, "Yes", "No"),
+                                   levels = c("Yes", "No")))
+
+test_preds_opt %>%
+  conf_mat(truth = high_burden, estimate = .pred_class_opt) %>%
+  autoplot(type = "heatmap") +
+  labs(
+    title = paste("Confusion Matrix at Optimized Threshold:", best_model_name),
+    subtitle = paste0("Youden's J threshold = ", best_j$threshold,
+                      " (vs. default 0.50)")
+  )
+```
+
+The threshold sweep reveals the dramatic impact of threshold choice under class imbalance. At the default 0.50 cutoff, the model achieves near-perfect specificity but poor sensitivity; it correctly identifies non-burdened households but misses most burdened ones. Lowering the threshold to the Youden's J optimum (`r best_j$threshold`) substantially improves sensitivity (from `r round(threshold_metrics$sensitivity[threshold_metrics$threshold == 0.50], 3)` to `r round(best_j$sensitivity, 3)`) while accepting a modest decrease in specificity. The F1-optimized threshold (`r best_f1$threshold`) strikes a balance tuned specifically for minority-class performance. In a screening deployment, the Youden's J threshold would be preferred because the cost of missing an at-risk household far exceeds the cost of a false referral to financial counseling.
+
+### 9.4 Model Interpretability
+
+We use three complementary approaches to model interpretability, progressing from classical epidemiological methods (odds ratios) to model-agnostic global rankings (VIP) to observation-level explanations (SHAP). This multi-lens strategy bridges the ML and biostatistics audiences and provides both population-level and individual-level insights.
+
+#### 9.4.1 Odds Ratios (Logistic Regression)
+
+The logistic regression model provides direct odds-ratio estimates for each predictor's association with financial toxicity, controlling for all other covariates. An odds ratio greater than 1 indicates increased risk, and less than 1 is protective. We display the adjusted odds ratios with 95% confidence intervals in a forest plot. Note that after recipe preprocessing, the ordinal variables (poverty and health status) are integer-scored and continuous predictors (age and education) are standardized, so ORs represent per-unit changes on the ordinal scale and per-SD changes for continuous variables, respectively.
+
+```{r odds-ratios}
+#| label: odds-ratios
+#| fig-height: 7
+
+log_fitted <- fit(log_wf, data = fyc_train)
+
+or_data <- log_fitted %>%
+  extract_fit_parsnip() %>%
+  tidy(exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = reorder(term, estimate))
+
+ggplot(or_data, aes(x = estimate, y = term)) +
+  geom_point(size = 2, color = clr_blue) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2, color = clr_blue) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+  scale_x_log10() +
+  labs(
+    x     = "Adjusted Odds Ratio (95% CI, log scale)",
+    y     = NULL,
+    title = "Logistic Regression: Adjusted Odds Ratios for High Financial Burden",
+    subtitle = "OR > 1 = increased risk | OR < 1 = protective | Dashed line = null effect"
+  ) +
+  theme(axis.text.y = element_text(size = 10))
+```
+
+The forest plot reveals the direction and magnitude of each predictor's association with financial toxicity in clinically meaningful units. Predictors with odds ratios far from 1.0 whose confidence intervals do not cross the null line at 1.0 are statistically significant at the 5% level. The ranking of predictors by odds ratio magnitude may differ from the VIP ranking because logistic regression assumes linear log-odds relationships while tree-based models capture nonlinearities and interactions.
+
+#### 9.4.2 Variable Importance (VIP)
+
+```{r vip-plot}
+#| label: vip-plot
+
+final_engine <- extract_fit_parsnip(final_fitted)
+
+if (best_model_name == "SVM RBF") {
+  cat("Variable importance is not available for SVM models with kernlab engine.\n",
+      "SVM uses all features in a kernel-transformed space, making individual\n",
+      "feature importance difficult to decompose.\n")
+} else {
+  vip(final_engine, num_features = 15) +
+    labs(
+      title = paste("Variable Importance:", best_model_name),
+      subtitle = "Top 15 predictors by model-specific importance"
+    ) +
+    theme_minimal(base_size = 13)
+}
+```
+
+The variable importance plot identifies which features drive the best model's predictions most strongly. Consistent with our EDA findings, we expect economic factors (poverty level and insurance type), care access barriers (delayed/forgone care), and chronic disease burden to feature prominently.
+
+::: {.callout-note}
+## Interpreting Variable Importance
+Variable importance measures are model-specific. For tree-based models, importance reflects the total reduction in impurity (Gini or information gain) attributable to each feature across all splits. For regularized linear models, it reflects the magnitude of standardized coefficients. These measures capture *predictive contribution within the model*, not causal effect. A variable can be important for prediction because it proxies for an unmeasured confounder rather than because it has a direct causal link to financial toxicity.
+:::
+
+#### 9.4.3 SHAP Analysis
+
+SHapley Additive exPlanations (SHAP) decompose each individual prediction into feature-level contributions using game-theoretic Shapley values. Unlike VIP (which ranks features globally), SHAP shows **how much** and **in what direction** each feature pushes each prediction. The beeswarm plot below displays the distribution of SHAP values across all training observations for the top features. This reveals nonlinear effects and interaction patterns that global importance measures cannot capture.
+
+> Lundberg, S. M., & Lee, S. I. (2017). A unified approach to interpreting model predictions. *Advances in Neural Information Processing Systems*, 30.
+
+```{r shap-analysis}
+#| label: shap-analysis
+#| fig-height: 8
+
+X_train_baked <- bake(base_prep, new_data = fyc_train) %>%
+  select(-high_burden)
+
+X_test_baked <- bake(base_prep, new_data = fyc_test) %>%
+  select(-high_burden)
+
+if (best_model_name == "XGBoost") {
+  xgb_engine <- final_fitted %>% extract_fit_engine()
+  shap_obj <- shapviz(xgb_engine, X_pred = as.matrix(X_train_baked))
+} else {
+  set.seed(231)
+  sub_idx <- sample(nrow(X_test_baked), min(500, nrow(X_test_baked)))
+  X_sub <- X_test_baked[sub_idx, ]
+
+  pfun <- function(object, newdata) {
+    predict(object, new_data = newdata, type = "prob")$.pred_Yes
+  }
+
+  ks <- kernelshap(final_fitted, X = X_sub, bg_X = X_sub, pred_fun = pfun)
+  shap_obj <- shapviz(ks)
+}
+
+sv_importance(shap_obj, kind = "beeswarm", max_display = 15) +
+  labs(title = paste("SHAP Beeswarm Plot:", best_model_name),
+       subtitle = "Each dot = one observation; color = feature value (red = high)")
+```
+
+```{r shap-waterfall}
+#| label: shap-waterfall
+#| fig-height: 6
+
+if (best_model_name == "XGBoost") {
+  shap_test <- shapviz(xgb_engine, X_pred = as.matrix(X_test_baked))
+  high_risk_idx <- which.max(test_preds$.pred_Yes)
+  sv_waterfall(shap_test, row_id = high_risk_idx) +
+    labs(title = "SHAP Waterfall: Highest-Risk Individual in Test Set",
+         subtitle = "How each feature contributes to this individual's predicted risk")
+} else {
+  high_risk_idx <- which.max(test_preds$.pred_Yes[sub_idx])
+  sv_waterfall(shap_obj, row_id = high_risk_idx) +
+    labs(title = "SHAP Waterfall: Highest-Risk Individual (Subsample)",
+         subtitle = "How each feature contributes to this individual's predicted risk")
+}
+```
+
+```{r shap-dependence}
+#| label: shap-dependence
+#| fig-height: 5
+
+sv_dependence(shap_obj, v = "poverty") +
+  labs(title = paste("SHAP Dependence: Poverty Score (", best_model_name, ")"),
+       subtitle = "Nonlinear effect of poverty on predicted financial burden risk")
+```
+
+The SHAP analysis complements VIP by revealing the *direction* and *magnitude* of each feature's effect at the observation level. The beeswarm plot shows that poverty's effect is strongly nonlinear; the poorest category contributes much more to predicted risk than incremental differences between middle and high income. The waterfall plot for the highest-risk individual demonstrates the clinical actionability of this approach: each feature's contribution is quantified, enabling targeted interventions. The dependence plot reveals the functional form of the poverty-risk relationship as captured by the model.
+
+The comparison between cross-validation and test set performance is encouraging. When the test ROC-AUC falls within the confidence interval implied by the CV standard error, we have evidence that the model generalizes well and has not overfit to the training data. Any degradation beyond the CV standard error would warrant investigation into potential distributional differences between the training and test sets.
+
+### 9.5 Calibration Assessment
+
+A model with strong discrimination (high ROC-AUC) may still produce poorly **calibrated** probabilities. When the model predicts $\hat{p} = 0.20$, the true positive rate among those observations may not actually be 20%. Calibration is critical for any deployment scenario where predicted probabilities inform clinical or policy decisions (e.g., triaging households into risk tiers). We assess calibration by binning predicted probabilities into deciles and comparing the mean predicted probability to the observed positive rate within each bin.
+
+```{r calibration-plot}
+#| label: calibration-plot
+#| fig-height: 5
+
+calibration_data <- test_preds %>%
+  mutate(
+    prob_bin = cut(.pred_Yes,
+                   breaks = seq(0, 1, by = 0.1),
+                   include.lowest = TRUE, right = FALSE)
+  ) %>%
+  group_by(prob_bin) %>%
+  summarise(
+    mean_predicted = mean(.pred_Yes),
+    mean_observed  = mean(high_burden == "Yes"),
+    n              = n(),
+    .groups        = "drop"
+  ) %>%
+  filter(n >= 5)
+
+ggplot(calibration_data, aes(x = mean_predicted, y = mean_observed)) +
+  geom_abline(intercept = 0, slope = 1, lty = 2, color = "grey50", linewidth = 0.8) +
+  geom_point(aes(size = n), color = clr_blue, alpha = 0.8) +
+  geom_line(color = clr_blue, linewidth = 0.6) +
+  scale_size_continuous(range = c(2, 8), name = "Observations\nin bin") +
+  coord_equal(xlim = c(0, max(0.5, max(calibration_data$mean_predicted) + 0.05)),
+              ylim = c(0, max(0.5, max(calibration_data$mean_observed) + 0.05))) +
+  labs(
+    title    = paste("Calibration Plot:", best_model_name, "(Test Set)"),
+    subtitle = "Perfect calibration lies on the dashed diagonal",
+    x        = "Mean Predicted Probability",
+    y        = "Observed Positive Rate"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+Points that fall close to the dashed diagonal indicate well-calibrated probability estimates. Systematic deviations above or below the diagonal indicate under- or over-prediction, respectively. Given the severe class imbalance (~4 to 5% positive rate), most observations will concentrate in the lowest probability bins. If the model tends to over-predict risk in the lowest bins or under-predict in the highest bins, then post-hoc calibration methods such as Platt scaling or isotonic regression could be applied to improve reliability for downstream decision-making.
+
+#### Brier Score
+
+The Brier score is a **proper scoring rule** that jointly measures discrimination and calibration as the mean squared error of predicted probabilities: $\text{BS} = \frac{1}{n}\sum_{i=1}^{n}(\hat{p}_i - y_i)^2$. A score of 0 is perfect and the no-skill baseline equals $\pi(1 - \pi)$ where $\pi$ is the prevalence. The Brier Skill Score ($\text{BSS} = 1 - \text{BS}/\text{BS}_{\text{baseline}}$) quantifies improvement over naive prevalence-based prediction.
+
+```{r brier-score}
+#| label: brier-score
+
+brier_score <- mean(
+  (test_preds$.pred_Yes - as.numeric(test_preds$high_burden == "Yes"))^2
+)
+
+prevalence_test <- mean(fyc_test$high_burden == "Yes")
+brier_baseline <- prevalence_test * (1 - prevalence_test)
+brier_skill <- 1 - brier_score / brier_baseline
+
+tibble(
+  Metric = c("Brier Score", "No-Skill Baseline", "Brier Skill Score"),
+  Value  = c(brier_score, brier_baseline, brier_skill)
+) %>%
+  gt() %>%
+  tab_header(
+    title = paste("Brier Score:", best_model_name, "(Test Set)"),
+    subtitle = "Lower Brier = better; positive BSS = better than prevalence prediction"
+  ) %>%
+  fmt_number(columns = Value, decimals = 4)
+```
+
+A positive Brier Skill Score confirms that the model's predicted probabilities are meaningfully better than naive prevalence-based predictions. The Brier score complements the visual calibration plot by providing a single summary metric that captures both the model's ability to discriminate between classes and the accuracy of its probability estimates.
+
+
+### 9.6 Bootstrap Confidence Intervals
+
+The test set ROC-AUC and PR-AUC reported above are point estimates from a single train/test split. To quantify the **statistical uncertainty** of these estimates, we construct 95% bootstrap confidence intervals by resampling the test set predictions with replacement 2,000 times and computing each metric on each bootstrap sample. This captures the sampling variability inherent in a finite test set without requiring additional model fitting.
+
+```{r bootstrap-ci}
+#| label: bootstrap-ci
+#| warning: false
+
+set.seed(231)
+n_boot <- 2000
+n_test <- nrow(test_preds)
+
+boot_roc <- numeric(n_boot)
+boot_pr  <- numeric(n_boot)
+
+for (b in seq_len(n_boot)) {
+  idx <- sample(n_test, replace = TRUE)
+  boot_sample <- test_preds[idx, ]
+
+  boot_roc[b] <- tryCatch(
+    suppressWarnings(roc_auc(boot_sample, truth = high_burden, .pred_Yes) %>% pull(.estimate)),
+    error = function(e) NA_real_
+  )
+  boot_pr[b] <- tryCatch(
+    suppressWarnings(pr_auc(boot_sample, truth = high_burden, .pred_Yes) %>% pull(.estimate)),
+    error = function(e) NA_real_
+  )
+}
+
+roc_ci <- quantile(boot_roc, probs = c(0.025, 0.975), na.rm = TRUE)
+pr_ci  <- quantile(boot_pr,  probs = c(0.025, 0.975), na.rm = TRUE)
+
+boot_summary <- tibble(
+  Metric     = c("ROC-AUC", "PR-AUC"),
+  Estimate   = c(test_roc_val, test_pr_val),
+  `CI Lower` = c(roc_ci[1], pr_ci[1]),
+  `CI Upper` = c(roc_ci[2], pr_ci[2])
+)
+
+boot_summary %>%
+  gt() %>%
+  tab_header(
+    title    = paste("Test Set Performance with 95% Bootstrap CIs:", best_model_name),
+    subtitle = paste0("Based on ", format(n_boot, big.mark = ","), " bootstrap resamples")
+  ) %>%
+  fmt_number(columns = c(Estimate, `CI Lower`, `CI Upper`), decimals = 4)
+```
+
+The width of the confidence intervals reflects how precise our test set estimates are. Narrow intervals mean the point estimates are stable and not overly sensitive to the particular composition of the test set. Wide intervals would suggest that the test set is too small (relative to the class imbalance) to pin down performance precisely. If the ROC-AUC confidence interval is entirely above 0.50, we can conclude with 95% confidence that the model discriminates better than chance. If the bootstrap distributions are approximately symmetric around the point estimates, this also suggests the estimates are not unduly influenced by a small number of extreme observations in the test set.
+
+
+### 9.7 Algorithmic Fairness Assessment
+
+A model with strong aggregate performance may still produce systematically different error rates across demographic groups. This is particularly concerning in healthcare applications. Obermeyer et al. (2019) demonstrated that a widely-used healthcare cost prediction algorithm systematically disadvantaged Black patients because it used healthcare costs (rather than health needs) as a proxy for illness. Underserved populations tend to spend less even when equally sick. Our outcome variable (OOP spending as a fraction of income) carries a structurally analogous risk: populations that underutilize care due to systemic barriers may appear "safer" to the model.
+
+We use the `fairmodels` package to compute 11+ fairness metrics across racial/ethnic groups, with Non-Hispanic White as the privileged reference group. This framework assesses whether the model satisfies equalized odds (equal TPR and FPR across groups), demographic parity (equal positive prediction rates), and predictive parity (equal PPV), among other criteria.
+
+> Obermeyer, Z., et al. (2019). Dissecting racial bias in an algorithm used to manage the health of populations. *Science*, 366(6464), 447-453.
+
+```{r fairness-explainer}
+#| label: fairness-explainer
+
+explainer_best <- DALEXtra::explain_tidymodels(
+  final_fitted,
+  data  = fyc_test %>% select(-high_burden),
+  y     = as.numeric(fyc_test$high_burden == "Yes"),
+  label = best_model_name,
+  verbose = FALSE
+)
+```
+
+```{r fairness-check}
+#| label: fairness-check
+#| fig-height: 7
+
+fobject <- fairmodels::fairness_check(
+  explainer_best,
+  protected  = fyc_test$race_eth,
+  privileged = "NH White",
+  verbose    = FALSE
+)
+
+plot(fobject) +
+  labs(title = paste("Fairness Radar Plot:", best_model_name),
+       subtitle = "Metrics computed relative to NH White (privileged group)")
+```
+
+```{r fairness-heatmap}
+#| label: fairness-heatmap
+#| fig-height: 5
+
+plot(fobject, type = "heatmap") +
+  labs(title = "Fairness Heatmap: Parity Loss Across Groups and Metrics")
+```
+
+```{r fairness-table}
+#| label: fairness-table
+
+fairness_metrics <- fobject$parity_loss_metric_data
+
+fairness_metrics %>%
+  gt() %>%
+  tab_header(
+    title    = "Parity Loss Metrics by Racial/Ethnic Group",
+    subtitle = paste("Model:", best_model_name, "| Reference: NH White")
+  ) %>%
+  fmt_number(columns = where(is.numeric), decimals = 3)
+```
+
+```{r fairness-subgroup-sizes}
+#| label: fairness-subgroup-sizes
+
+fyc_test %>%
+  group_by(race_eth) %>%
+  summarise(
+    n        = n(),
+    n_pos    = sum(high_burden == "Yes"),
+    pos_rate = mean(high_burden == "Yes"),
+    .groups  = "drop"
+  ) %>%
+  gt() %>%
+  tab_header(title = "Test Set: Subgroup Sizes and Positive Rates") %>%
+  fmt_number(columns = pos_rate, decimals = 3) %>%
+  cols_label(
+    race_eth = "Race/Ethnicity",
+    n        = "N",
+    n_pos    = "N Positive",
+    pos_rate = "Positive Rate"
+  )
+```
+
+The fairness assessment reveals whether the model produces equitable predictions across racial/ethnic groups. Key things to examine include: (1) whether any group experiences substantially higher false negative rates (missed high-burden households), which would indicate the model is systematically less protective for that group; (2) whether the model satisfies the 4/5ths rule for disparate impact; and (3) whether there are groups where the model is systematically overconfident or underconfident.
+
+It is important to acknowledge the **impossibility theorem** (Chouldechova, 2017): a model cannot simultaneously satisfy equalized odds and predictive parity unless base rates are equal across groups. Since financial burden prevalence varies substantially across racial/ethnic groups (as shown in the subgroup table above), some degree of fairness metric tension is mathematically inevitable. The practical question is whether the observed disparities are large enough to warrant mitigation strategies such as group-specific threshold calibration or post-processing fairness constraints.
+
+::: {.callout-note}
+## Race as Predictor and Protected Attribute
+In this analysis `race_eth` serves dual roles: it is a predictor in the model (because race/ethnicity is associated with financial burden through systemic inequities in insurance coverage, healthcare access, and employment) AND the protected attribute for the fairness audit. This is intentional. We are assessing whether the model produces equitable *error rates* across groups, not whether it uses race. Removing race from the model would not eliminate disparities (other correlated predictors would serve as proxies) and could actually worsen group-specific performance.
+:::
+
+
+## 10. Sensitivity Analysis
+
+### 10.1 Healthcare Utilization Variables
+
+The base model deliberately excludes healthcare utilization variables (office visits, ER visits, inpatient discharges, and home health days) because these may be endogenous with respect to financial burden. Households that spend more out-of-pocket naturally have higher utilization, creating a feedback loop that inflates apparent predictive performance. However, from a purely predictive standpoint, utilization patterns may capture information not already reflected in demographics and clinical indicators.
+
+We conduct a sensitivity analysis by defining an extended recipe that includes the four utilization variables and retraining the best model (with the same optimized hyperparameters) to assess whether discrimination improves materially. This isolates the contribution of utilization variables while holding all other modeling choices constant.
+
+```{r extended-recipe}
+#| label: extended-recipe
+
+extended_recipe <- recipe(
+  high_burden ~ AGE22X + EDUCYR + sex + race_eth + region + poverty +
+    insurance + health_phys + health_ment + diabetes + highbp + asthma +
+    arthritis + cancer + stroke + delayed_care + forgone_care +
+    OBTOTV22 + ERTOT22 + IPDIS22 + HHTOTD22,
+  data = fyc_train
+) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_ordinalscore(poverty, health_phys, health_ment) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+```{r sensitivity-fit}
+#| label: sensitivity-fit
+
+if (best_model_name == "XGBoost") {
+  ext_wf <- workflow() %>%
+    add_recipe(extended_recipe) %>%
+    add_model(xgb_spec) %>%
+    finalize_workflow(best_params)
+} else if (best_model_name == "Random Forest") {
+  ext_wf <- workflow() %>%
+    add_recipe(extended_recipe) %>%
+    add_model(rf_spec) %>%
+    finalize_workflow(best_params)
+} else if (best_model_name == "Elastic Net") {
+  ext_wf <- workflow() %>%
+    add_recipe(extended_recipe) %>%
+    add_model(enet_spec) %>%
+    finalize_workflow(best_params)
+} else if (best_model_name == "SVM RBF") {
+  ext_wf <- workflow() %>%
+    add_recipe(extended_recipe) %>%
+    add_model(svm_spec) %>%
+    finalize_workflow(best_params)
+} else if (best_model_name == "BART") {
+  ext_wf <- workflow() %>%
+    add_recipe(extended_recipe) %>%
+    add_model(bart_spec) %>%
+    finalize_workflow(best_params)
+} else {
+  ext_wf <- workflow() %>%
+    add_recipe(extended_recipe) %>%
+    add_model(log_spec)
+}
+
+if (file.exists("data/ext_fit.RData")) {
+  load("data/ext_fit.RData")
+} else {
+  ext_fit <- ext_wf %>%
+    fit_resamples(
+      resamples = cv_folds,
+      metrics   = burden_metrics,
+      control   = ctrl
+    )
+  save(ext_fit, file = "data/ext_fit.RData")
+}
+```
+
+```{r sensitivity-comparison}
+#| label: sensitivity-comparison
+
+if (best_model_name == "Logistic Regression") {
+  base_cv_metrics <- collect_metrics(log_fit)
+} else if (best_model_name == "Elastic Net") {
+  best_config <- select_best(enet_tune, metric = "roc_auc")
+  base_cv_metrics <- collect_metrics(enet_tune) %>%
+    inner_join(best_config, by = names(best_config)[!names(best_config) %in% ".config"])
+} else if (best_model_name == "Random Forest") {
+  best_config <- select_best(rf_tune, metric = "roc_auc")
+  base_cv_metrics <- collect_metrics(rf_tune) %>%
+    inner_join(best_config, by = names(best_config)[!names(best_config) %in% ".config"])
+} else if (best_model_name == "XGBoost") {
+  best_config <- select_best(xgb_tune, metric = "roc_auc")
+  base_cv_metrics <- collect_metrics(xgb_tune) %>%
+    inner_join(best_config, by = names(best_config)[!names(best_config) %in% ".config"])
+} else if (best_model_name == "BART") {
+  best_config <- select_best(bart_tune, metric = "roc_auc")
+  base_cv_metrics <- collect_metrics(bart_tune) %>%
+    inner_join(best_config, by = names(best_config)[!names(best_config) %in% ".config"])
+} else {
+  best_config <- select_best(svm_tune, metric = "roc_auc")
+  base_cv_metrics <- collect_metrics(svm_tune) %>%
+    inner_join(best_config, by = names(best_config)[!names(best_config) %in% ".config"])
+}
+
+ext_cv_metrics <- collect_metrics(ext_fit)
+
+sensitivity_tbl <- tibble(
+  Recipe  = rep(c("Base (17 predictors)", "Extended (+4 utilization)"), each = 2),
+  Metric  = rep(c("ROC-AUC", "PR-AUC"), 2),
+  Mean    = c(
+    base_cv_metrics %>% filter(.metric == "roc_auc") %>% pull(mean) %>% first(),
+    base_cv_metrics %>% filter(.metric == "pr_auc") %>% pull(mean) %>% first(),
+    ext_cv_metrics %>% filter(.metric == "roc_auc") %>% pull(mean),
+    ext_cv_metrics %>% filter(.metric == "pr_auc") %>% pull(mean)
+  ),
+  SE      = c(
+    base_cv_metrics %>% filter(.metric == "roc_auc") %>% pull(std_err) %>% first(),
+    base_cv_metrics %>% filter(.metric == "pr_auc") %>% pull(std_err) %>% first(),
+    ext_cv_metrics %>% filter(.metric == "roc_auc") %>% pull(std_err),
+    ext_cv_metrics %>% filter(.metric == "pr_auc") %>% pull(std_err)
+  )
+)
+
+sensitivity_tbl %>%
+  gt() %>%
+  tab_header(
+    title    = "Sensitivity Analysis: Base vs. Extended Recipe",
+    subtitle = paste("Model:", best_model_name, "| 10-Fold Stratified CV")
+  ) %>%
+  fmt_number(columns = c(Mean, SE), decimals = 4)
+```
+
+::: {.callout-note}
+## Endogeneity and Leakage Risk
+Healthcare utilization variables (office visits, ER visits, inpatient discharges, and home health days) are recorded contemporaneously with out-of-pocket spending. A household classified as "high burden" almost by definition has high utilization. Including these variables risks **data leakage**: the model may learn to predict the outcome using a near-proxy of the outcome itself, yielding inflated performance that would not generalize to a prospective setting. If the extended recipe shows a large improvement, it should be interpreted cautiously.
+:::
+
+The sensitivity analysis quantifies the predictive contribution of utilization variables. If ROC-AUC improves substantially (e.g., by more than 0.02), it suggests that utilization captures information beyond demographics and clinical indicators, but the endogeneity concern means this improvement may not reflect genuine prospective discrimination. If the improvement is marginal (less than 0.01), this supports the base model specification by suggesting that utilization does not add meaningful discrimination once demographics, clinical indicators, and care access barriers are accounted for.
+
+From a practical standpoint, the base model is preferable for deployment because it relies only on information that is typically available before healthcare encounters occur (demographics, existing diagnoses, and insurance status). Utilization variables are only observed after the fact. A prospective screening tool based on the base model could flag at-risk households at the point of insurance enrollment or primary care intake, enabling proactive financial counseling before costs accumulate.
+
+### 10.2 Alternative Burden Thresholds
+
+Our primary analysis defines high financial burden using a 10% OOP-to-income threshold consistent with the WHO's standard for catastrophic health expenditure (CHE). However, the WHO and World Bank also use a 25% threshold, and Kim et al. (2025) tested 10%, 20%, 30%, and 40% in their BMC analysis of CHE prediction. To assess the robustness of our findings across burden definitions, we re-derive the binary outcome at four thresholds (10%, 20%, 25%, and 40%) and re-evaluate the finalized model at each. We do **not** re-tune hyperparameters (the same finalized workflow is applied to each redefined outcome) to isolate the effect of threshold choice from model selection.
+
+> World Health Organization. (2021). *Global monitoring report on financial protection in health 2021*. Geneva: WHO.
+>
+> Kim, S., et al. (2025). Machine learning based classification of catastrophic health expenditures. *BMC Health Services Research*.
+
+```{r multi-threshold}
+#| label: multi-threshold
+#| fig-height: 5
+
+thresholds_che <- c(0.10, 0.20, 0.25, 0.40)
+
+threshold_results <- map_dfr(thresholds_che, function(thr) {
+
+  fyc_train_thr <- fyc_train %>%
+    mutate(high_burden = factor(
+      ifelse(TOTSLF22 / FAMINC22 > thr, "Yes", "No"),
+      levels = c("Yes", "No")
+    ))
+
+  fyc_test_thr <- fyc_test %>%
+    mutate(high_burden = factor(
+      ifelse(TOTSLF22 / FAMINC22 > thr, "Yes", "No"),
+      levels = c("Yes", "No")
+    ))
+
+  pos_rate <- mean(fyc_train_thr$high_burden == "Yes")
+
+  thr_fitted <- fit(final_wf, data = fyc_train_thr)
+
+  thr_preds <- augment(thr_fitted, new_data = fyc_test_thr)
+
+  tibble(
+    threshold     = paste0(thr * 100, "%"),
+    positive_rate = pos_rate,
+    roc_auc       = roc_auc(thr_preds, truth = high_burden, .pred_Yes)$.estimate,
+    pr_auc        = pr_auc(thr_preds, truth = high_burden, .pred_Yes)$.estimate
+  )
+})
+
+threshold_results %>%
+  gt() %>%
+  tab_header(
+    title    = "Model Performance Across CHE Thresholds",
+    subtitle = paste("Model:", best_model_name, "| Same hyperparameters across all thresholds")
+  ) %>%
+  fmt_percent(columns = positive_rate, decimals = 1) %>%
+  fmt_number(columns = c(roc_auc, pr_auc), decimals = 4) %>%
+  cols_label(
+    threshold     = "CHE Threshold",
+    positive_rate = "Positive Rate",
+    roc_auc       = "ROC-AUC",
+    pr_auc        = "PR-AUC"
+  )
+```
+
+```{r multi-threshold-plot}
+#| label: multi-threshold-plot
+#| fig-height: 5
+
+threshold_results %>%
+  pivot_longer(c(roc_auc, pr_auc), names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = threshold, y = value, fill = metric)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  scale_fill_manual(
+    values = c("roc_auc" = clr_blue, "pr_auc" = clr_red),
+    labels = c("ROC-AUC", "PR-AUC")
+  ) +
+  labs(
+    title    = "Model Performance Across CHE Thresholds",
+    subtitle = paste("Model:", best_model_name),
+    x        = "OOP-to-Income Threshold",
+    y        = "Metric Value",
+    fill     = "Metric"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+As the threshold increases from 10% to 40%, the positive rate drops substantially, reflecting increasingly restrictive definitions of catastrophic expenditure. ROC-AUC tends to remain relatively stable across thresholds (since the model's ranking ability is robust to prevalence changes), while PR-AUC degrades as class imbalance worsens. This is a mathematically expected result, since precision becomes harder to maintain when the positive class shrinks. The analysis confirms that our modeling pipeline performs robustly across standard WHO/World Bank CHE definitions, though the choice of threshold materially affects the practical utility of the predictions.
+
+### 10.3 Interaction Effects in Linear Models
+
+The EDA (Section 2.5) and existing literature (Choi et al. 2020) highlight the **poverty x insurance** interaction as a critical mechanism. Publicly insured individuals appear to have higher burden rates only because they are disproportionately poor (Simpson's paradox). Tree-based models (random forest, XGBoost, and BART) capture this interaction natively through recursive partitioning, but the linear models (logistic regression and elastic net) can only learn the interaction if it is explicitly specified. We test whether adding a `poverty x insurance` interaction term to the recipe materially improves the logistic regression's discrimination.
+
+```{r interaction-recipe}
+#| label: interaction-recipe
+
+interaction_recipe <- recipe(
+  high_burden ~ AGE22X + EDUCYR + sex + race_eth + region + poverty +
+    insurance + health_phys + health_ment + diabetes + highbp + asthma +
+    arthritis + cancer + stroke + delayed_care + forgone_care,
+  data = fyc_train
+) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_ordinalscore(poverty, health_phys, health_ment) %>%
+  step_interact(~ poverty:insurance) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+int_log_wf <- workflow() %>%
+  add_recipe(interaction_recipe) %>%
+  add_model(log_spec)
+
+int_log_fit <- int_log_wf %>%
+  fit_resamples(
+    resamples = cv_folds,
+    metrics   = burden_metrics,
+    control   = ctrl
+  )
+```
+
+```{r interaction-comparison}
+#| label: interaction-comparison
+
+bind_rows(
+  collect_metrics(log_fit) %>% mutate(model = "Logistic (base)"),
+  collect_metrics(int_log_fit) %>% mutate(model = "Logistic (+ poverty x insurance)")
+) %>%
+  select(model, .metric, mean, std_err) %>%
+  pivot_wider(
+    names_from  = .metric,
+    values_from = c(mean, std_err),
+    names_glue  = "{.metric}_{.value}"
+  ) %>%
+  gt() %>%
+  tab_header(
+    title    = "Interaction Effect: Base vs. Poverty x Insurance Logistic Regression",
+    subtitle = "10-Fold Stratified Cross-Validation"
+  ) %>%
+  fmt_number(columns = where(is.numeric), decimals = 4) %>%
+  cols_label(
+    model           = "Model",
+    roc_auc_mean    = "ROC-AUC (Mean)",
+    roc_auc_std_err = "ROC-AUC (SE)",
+    pr_auc_mean     = "PR-AUC (Mean)",
+    pr_auc_std_err  = "PR-AUC (SE)"
+  )
+```
+
+The comparison reveals whether explicit interaction specification improves linear model performance. If the interaction model shows a meaningful ROC-AUC improvement (even small gains are notable given the simplicity of the change), this validates that the Simpson's paradox effect identified in the EDA is predictively important and that tree-based models were already capturing it natively. If the improvement is negligible, it suggests that the main effects (after ordinal scoring) already capture sufficient information about the poverty-insurance relationship.
+
+
+## 11. Conclusion
+
+### 11.1 Summary of Findings
+
+This project developed and compared six supervised classification models (logistic regression, elastic net, random forest, XGBoost, SVM, and BART) to predict healthcare financial toxicity using the 2022 MEPS data. After 10-fold stratified cross-validation with hyperparameter tuning across 202 total configurations (2,020 individual model fits), the best-performing model achieved strong discrimination on the held-out test set as measured by both ROC-AUC and PR-AUC. A multi-lens interpretability analysis combining odds ratios from logistic regression, model-specific variable importance, and SHAP values confirmed the central role of economic factors (poverty level and insurance type), care access barriers (delayed and forgone care), and chronic disease burden in predicting high financial burden. This is consistent with the patterns identified during exploratory analysis.
+
+The sensitivity analyses demonstrated three key findings. First, healthcare utilization variables provide limited additional discrimination once the base predictor set is accounted for, supporting the more parsimonious model for prospective applications. Second, model performance is robust across WHO/World Bank CHE thresholds (10% to 40%), with ROC-AUC remaining stable even as class imbalance intensifies. Third, the poverty x insurance interaction effect, while theoretically important (Simpson's paradox), has a quantifiable impact on linear model performance that validates the use of flexible learners. The algorithmic fairness audit assessed error rate equity across racial/ethnic groups and engages directly with the structural concerns raised by Obermeyer et al. (2019) regarding cost-based health algorithms.
+
+### 11.2 Limitations
+
+Several limitations are worth acknowledging. First, the cross-sectional design of MEPS precludes causal inference. We cannot determine whether poverty *causes* financial toxicity or merely correlates with it through shared confounders such as health literacy, geographic access to care, or employment stability. Second, although MEPS provides survey weights to produce nationally representative estimates, we did not incorporate these weights into the machine learning pipeline. Tidymodels does not natively support survey-weighted loss functions, so our predictions reflect unweighted associations and may not generalize precisely to population-level prevalence. Third, although Section 9.5 presents a calibration assessment with a Brier score, we did not apply formal calibration tests (e.g., the Hosmer-Lemeshow test) or post-hoc recalibration methods (Platt scaling or isotonic regression). These would strengthen confidence in the predicted probabilities for deployment scenarios. Fourth, the fairness audit (Section 9.7) identifies group-level disparities but does not implement mitigation strategies such as group-specific threshold calibration or post-processing fairness constraints. These would be essential for a production deployment.
+
+### 11.3 Future Directions
+
+Future work could extend this analysis in several promising directions. First, longitudinal panel data from MEPS (which follows respondents over two years) would enable dynamic prediction of financial toxicity onset, capturing how life events like job loss or new diagnoses evolve into financial hardship over time. This would address the fundamental limitation of cross-sectional prediction by allowing the model to incorporate temporal trajectories of spending and health status.
+
+Second, survey-weighted model evaluation per Zhu et al. (2023) could produce nationally representative performance estimates, addressing the gap between our unweighted associations and population-level generalizability.
+
+Third, cost-sensitive learning frameworks could incorporate the asymmetric costs of false positives versus false negatives, reflecting the clinical reality that failing to identify an at-risk household (which may forego necessary care or face bankruptcy) is more costly than a false alarm (which wastes a financial counselor's time).
+
+Fourth, causal forest analysis (Athey & Imbens, 2016) could estimate heterogeneous treatment effects of insurance type on financial burden, extending the Simpson's paradox finding from our interaction analysis (Section 10.3) into a causal inference framework.
+
+Fifth, deploying such a model in practice (for instance, as a risk-screening tool integrated into hospital financial counseling workflows or insurance enrollment platforms) would require prospective validation on new cohorts, calibration to local populations, and careful attention to the gap between retrospective survey data and real-time clinical environments.
+
+```{r cleanup}
+#| label: cleanup
+#| include: false
+
+doParallel::stopImplicitCluster()
+```

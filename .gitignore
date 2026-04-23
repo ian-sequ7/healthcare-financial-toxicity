@@ -1,0 +1,15 @@
+.DS_Store
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.claude/
+.playwright-mcp/
+data/
+data-resume/
+*.dta
+*.RData
+*_files/
+.quarto/
+_freeze/
+.env
