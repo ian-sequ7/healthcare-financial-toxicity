@@ -375,6 +375,46 @@ The EDA reveals several patterns that directly inform our modeling strategy:
 
 A comprehensive exploratory analysis with full visualizations, survey-weighted estimates, and interaction heatmaps is available in the companion document `eda.qmd`.
 
+### 2.8 Race and Ethnicity Under an Out-of-Pocket Threshold
+
+One EDA result warrants closer inspection before we proceed to modeling. The Hispanic positive rate in the test set (2.1%) sits substantially below the Non-Hispanic White rate (6.7%), which inverts the association observed in earlier MEPS burden literature. Bernard et al. (2015) reported elevated out-of-pocket burden among Hispanic households conditional on chronic-condition status, and related work on cost-related access barriers consistently finds that Hispanic households experience greater financial pressure than non-Hispanic White households at comparable income levels. A plausible reconciliation is that the 10% OOP-to-income definition measures realized spending rather than unmet need. Households that forgo or delay care because they cannot afford it will record low out-of-pocket outlays and therefore appear low-burden under this definition, even when true financial pressure is high. If Hispanic households are more likely to forgo or delay care, or are more likely to be uninsured, the cost-based threshold will systematically under-count their true burden.
+
+```{r eda-hispanic-access}
+#| label: eda-hispanic-access
+
+access_crosstab <- fyc_train %>%
+  group_by(race_eth) %>%
+  summarise(
+    n            = n(),
+    forgone_rate = mean(forgone_care == "Yes", na.rm = TRUE),
+    delayed_rate = mean(delayed_care == "Yes", na.rm = TRUE),
+    uninsured    = mean(insurance == "Uninsured", na.rm = TRUE),
+    public_only  = mean(insurance == "Public Only", na.rm = TRUE),
+    .groups      = "drop"
+  )
+
+access_crosstab %>%
+  gt() %>%
+  tab_header(
+    title    = "Access Barriers by Race/Ethnicity (Training Set)",
+    subtitle = "Proportions of forgone care, delayed care, and insurance status"
+  ) %>%
+  fmt_number(columns = c(forgone_rate, delayed_rate, uninsured, public_only),
+             decimals = 3) %>%
+  cols_label(
+    race_eth     = "Race/Ethnicity",
+    n            = "N",
+    forgone_rate = "Forgone Care",
+    delayed_rate = "Delayed Care",
+    uninsured    = "Uninsured",
+    public_only  = "Public Only"
+  )
+```
+
+The cross-tab provides direct evidence on the measurement-limitation hypothesis. If Hispanic households show elevated forgone-care or delayed-care rates relative to non-Hispanic White households, or if their uninsurance rate is substantially higher, the pattern is consistent with care avoidance suppressing observed out-of-pocket spending below the 10% threshold. Under that reading, the low Hispanic positive rate in our training data reflects an artifact of the definition rather than genuinely lower financial pressure. We cannot make stronger causal claims from a cross-sectional snapshot, but if the access-barrier gap is large the conditional interpretation is defensible.
+
+This observation indicates a structural limitation of cost-based burden definitions that Section 11.2 should discuss as a measurement boundary of the present analysis.
+
 
 ## 3. Setup & Preprocessing
 
@@ -1306,6 +1346,48 @@ autoplot(test_pr) +
   )
 ```
 
+#### 9.2.1 Cross-Validation Stability
+
+The test-set ROC-AUC (approximately 0.874) exceeds the mean 10-fold CV ROC-AUC (approximately 0.824) by roughly 0.05. Two mechanisms explain this gap. First, the finalized model is refit on the full training set while each CV fold uses only 90% of training observations, so the finalized model benefits from more data than any single fold saw during tuning. Second, the test set is a single 20% draw from the underlying distribution and therefore carries sampling variability of its own. Neither mechanism signals overfitting. To quantify how much of the gap is ordinary sampling noise, we rerun cross-validation with five repeats of 10-fold stratified sampling and inspect the distribution of fold-level AUCs.
+
+```{r cv-stability}
+#| label: cv-stability
+#| cache: true
+#| fig-height: 5
+
+set.seed(231)
+cv_repeated <- vfold_cv(fyc_train, v = 10, strata = high_burden, repeats = 5)
+
+cv_stability_res <- final_wf %>%
+  fit_resamples(
+    resamples = cv_repeated,
+    metrics   = metric_set(roc_auc),
+    control   = control_resamples(save_pred = FALSE)
+  )
+
+fold_aucs <- collect_metrics(cv_stability_res, summarize = FALSE) %>%
+  filter(.metric == "roc_auc")
+
+fold_q <- quantile(fold_aucs$.estimate, probs = c(0.05, 0.95))
+
+ggplot(fold_aucs, aes(x = .estimate)) +
+  geom_density(fill = clr_blue, alpha = 0.35, color = clr_blue) +
+  geom_vline(xintercept = test_roc_val, linetype = "dashed",
+             color = clr_red, linewidth = 0.8) +
+  annotate("text", x = test_roc_val, y = 0,
+           label = paste0("Test AUC = ", round(test_roc_val, 3)),
+           hjust = -0.05, vjust = -0.8, color = clr_red, size = 4) +
+  labs(
+    x     = "Fold-level ROC-AUC",
+    y     = "Density",
+    title = "Cross-Validation Stability: Fold-Level ROC-AUC (50 folds)",
+    subtitle = paste0("5 repeats of 10-fold stratified CV on the finalized ", best_model_name, " specification")
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The 5th and 95th percentiles of the 50-fold ROC-AUC distribution (`r round(fold_q[1], 3)` and `r round(fold_q[2], 3)`) bracket the range expected from ordinary sampling variability. The test set ROC-AUC of `r round(test_roc_val, 3)` falls near the upper edge of this range (just below the 95th percentile), which is consistent with the split-induced variability mechanism described above rather than with any systematic optimism. The refit-on-full-training effect contributes the remaining gap, and the absence of a gap larger than the fold-level range is evidence that the finalized model has not overfit to the training set.
+
 ### 9.3 Confusion Matrix
 
 ```{r confusion-matrix}
@@ -1444,7 +1526,7 @@ test_preds_opt %>%
   )
 ```
 
-The threshold sweep reveals the dramatic impact of threshold choice under class imbalance. At the default 0.50 cutoff, the model achieves near-perfect specificity but poor sensitivity; it correctly identifies non-burdened households but misses most burdened ones. Lowering the threshold to the Youden's J optimum (`r best_j$threshold`) substantially improves sensitivity (from `r round(threshold_metrics$sensitivity[threshold_metrics$threshold == 0.50], 3)` to `r round(best_j$sensitivity, 3)`) while accepting a modest decrease in specificity. The F1-optimized threshold (`r best_f1$threshold`) strikes a balance tuned specifically for minority-class performance. In a screening deployment, the Youden's J threshold would be preferred because the cost of missing an at-risk household far exceeds the cost of a false referral to financial counseling.
+The threshold sweep reveals the dramatic impact of threshold choice under class imbalance. At the default 0.50 cutoff, the model achieves near-perfect specificity but poor sensitivity; it correctly identifies non-burdened households but misses most burdened ones. Lowering the threshold to the Youden's J optimum (`r best_j$threshold`) substantially improves sensitivity (from `r round(threshold_metrics$sensitivity[threshold_metrics$threshold == 0.50], 3)` to `r round(best_j$sensitivity, 3)`) while accepting a modest decrease in specificity. The F1-optimized threshold (`r best_f1$threshold`) strikes a balance tuned specifically for minority-class performance. In a screening deployment, the Youden's J threshold would be preferred because the cost of missing an at-risk household far exceeds the cost of a false referral to financial counseling. At the Youden's J threshold (`r best_j$threshold`) with precision `r round(best_j$precision, 3)`, each true-positive flag in deployment is accompanied by roughly `r round((1 - best_j$precision) / best_j$precision, 1)` false flags, a counseling-load ratio that policy implementers should weigh against the cost of missing a genuinely burdened household.
 
 ### 9.4 Model Interpretability
 
@@ -1454,11 +1536,43 @@ We use three complementary approaches to model interpretability, progressing fro
 
 The logistic regression model provides direct odds-ratio estimates for each predictor's association with financial toxicity, controlling for all other covariates. An odds ratio greater than 1 indicates increased risk, and less than 1 is protective. We display the adjusted odds ratios with 95% confidence intervals in a forest plot. Note that after recipe preprocessing, the ordinal variables (poverty and health status) are integer-scored and continuous predictors (age and education) are standardized, so ORs represent per-unit changes on the ordinal scale and per-SD changes for continuous variables, respectively.
 
+Before the full forest plot, we surface the ten strongest adjusted associations in tabular form. Each odds ratio in the table is adjusted for all other covariates in the model, so the reported value represents the partial association of the predictor with high financial burden conditional on every other feature. Ordinal predictors (poverty and health status) contribute per-unit changes on the ordinal scale, and the continuous predictors (age and education) contribute per-standard-deviation changes after the recipe's normalization step. The forest plot immediately below visualizes the full predictor set for completeness, while the table surfaces the ten strongest associations for quick reference. One observation worth flagging: the cost-related access variables (forgone_care, delayed_care) that featured prominently in the EDA do not appear in the top ten by |log(OR)|. Their marginal signal is likely absorbed by the poverty and insurance predictors with which they are strongly correlated.
+
+```{r odds-ratio-table}
+#| label: odds-ratio-table
+
+log_fitted <- fit(log_wf, data = fyc_train)
+
+log_or_tidy <- log_fitted %>%
+  extract_fit_parsnip() %>%
+  tidy(exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)")
+
+or_top10 <- log_or_tidy %>%
+  mutate(abs_log_or = abs(log(estimate))) %>%
+  arrange(desc(abs_log_or)) %>%
+  slice_head(n = 10) %>%
+  transmute(
+    Predictor        = term,
+    OR               = estimate,
+    `95% CI Lower`   = conf.low,
+    `95% CI Upper`   = conf.high,
+    `p-value`        = p.value
+  )
+
+or_top10 %>%
+  gt() %>%
+  tab_header(
+    title    = "Top 10 Predictors by |log(OR)|",
+    subtitle = "Adjusted odds ratios from logistic regression (ordered by effect magnitude)"
+  ) %>%
+  fmt_number(columns = c(OR, `95% CI Lower`, `95% CI Upper`), decimals = 3) %>%
+  fmt_number(columns = `p-value`, decimals = 4)
+```
+
 ```{r odds-ratios}
 #| label: odds-ratios
 #| fig-height: 7
-
-log_fitted <- fit(log_wf, data = fyc_train)
 
 or_data <- log_fitted %>%
   extract_fit_parsnip() %>%
@@ -1577,6 +1691,63 @@ sv_dependence(shap_obj, v = "poverty") +
 
 The SHAP analysis complements VIP by revealing the *direction* and *magnitude* of each feature's effect at the observation level. The beeswarm plot shows that poverty's effect is strongly nonlinear; the poorest category contributes much more to predicted risk than incremental differences between middle and high income. The waterfall plot for the highest-risk individual demonstrates the clinical actionability of this approach: each feature's contribution is quantified, enabling targeted interventions. The dependence plot reveals the functional form of the poverty-risk relationship as captured by the model.
 
+##### Cross-Model SHAP Consistency
+
+The SHAP beeswarm and dependence plots above are computed from XGBoost only, so a reader may reasonably ask whether the strongly nonlinear poverty effect is an artifact of gradient boosting or a stable finding across model classes. BART is the natural second lens: it is the second-ranked model on CV ROC-AUC (within one standard error of XGBoost in Section 8), and it uses a different inductive bias (Bayesian sum-of-trees with regularizing priors on tree depth) that smooths predictions through posterior averaging rather than through shrinkage-free greedy splits. If both models assign SHAP weight concentrated at the poorest poverty category, the threshold interpretation of the poverty effect is strengthened. If BART instead shows a smoother gradient across poverty levels, the threshold reading should be attributed to XGBoost's structure rather than to a stable population-level pattern.
+
+```{r shap-bart}
+#| label: shap-bart
+#| eval: false
+
+# Disabled by default because kernel-SHAP on a 200-observation subsample
+# with BART takes approximately 30 minutes on a modern laptop. Set
+# `eval: true` above to enable for the camera-ready render.
+
+bart_best     <- select_best(bart_tune, metric = "roc_auc")
+bart_final_wf <- finalize_workflow(bart_wf, bart_best)
+bart_fitted   <- fit(bart_final_wf, data = fyc_train)
+
+X_test_bart <- bake(base_prep, new_data = fyc_test) %>%
+  select(-high_burden)
+
+set.seed(231)
+sub_idx_bart <- sample(nrow(X_test_bart), 200)
+X_sub_bart   <- X_test_bart[sub_idx_bart, ]
+
+pfun_bart <- function(object, newdata) {
+  predict(object, new_data = newdata, type = "prob")$.pred_Yes
+}
+
+ks_bart   <- kernelshap::kernelshap(
+  bart_fitted, X = X_sub_bart, bg_X = X_sub_bart, pred_fun = pfun_bart
+)
+shap_bart <- shapviz::shapviz(ks_bart)
+
+sv_dependence(shap_bart, v = "poverty") +
+  labs(title = "SHAP Dependence: Poverty (BART)",
+       subtitle = "Bayesian sum-of-trees consistency check on 200-obs subsample")
+```
+
+```{r shap-bart-plot}
+#| label: shap-bart-plot
+#| eval: false
+
+# Disabled by default because it depends on `shap_bart` from the chunk above.
+# Set `eval: true` on both chunks for the camera-ready render.
+
+p_xgb <- sv_dependence(shap_obj, v = "poverty") +
+  labs(title = "XGBoost", subtitle = NULL)
+
+p_bart <- sv_dependence(shap_bart, v = "poverty") +
+  labs(title = "BART", subtitle = NULL)
+
+(p_xgb | p_bart) +
+  patchwork::plot_annotation(
+    title    = "SHAP Dependence on Poverty: XGBoost vs. BART",
+    subtitle = "Consistency check across model classes"
+  )
+```
+
 The comparison between cross-validation and test set performance is encouraging. When the test ROC-AUC falls within the confidence interval implied by the CV standard error, we have evidence that the model generalizes well and has not overfit to the training data. Any degradation beyond the CV standard error would warrant investigation into potential distributional differences between the training and test sets.
 
 ### 9.5 Calibration Assessment
@@ -1648,6 +1819,128 @@ tibble(
 ```
 
 A positive Brier Skill Score confirms that the model's predicted probabilities are meaningfully better than naive prevalence-based predictions. The Brier score complements the visual calibration plot by providing a single summary metric that captures both the model's ability to discriminate between classes and the accuracy of its probability estimates.
+
+#### Formal Calibration Tests
+
+The calibration plot and Brier score provide visual and aggregate evidence, respectively, but formal statistical tests sharpen the reading. We compute four quantities: the calibration intercept from a logistic regression of the outcome on the logit of the predicted probability (expected to be 0 under perfect calibration), the slope of that same regression (expected to be 1), the Spiegelhalter Z-statistic with its two-sided p-value, and the Expected Calibration Error across 10 equal-width probability bins.
+
+```{r calibration-formal}
+#| label: calibration-formal
+
+y_test <- as.numeric(test_preds$high_burden == "Yes")
+p_test <- test_preds$.pred_Yes
+
+p_clip  <- pmin(pmax(p_test, 1e-6), 1 - 1e-6)
+logit_p <- log(p_clip / (1 - p_clip))
+
+cal_mod <- glm(y_test ~ logit_p, family = binomial())
+cal_intercept <- unname(coef(cal_mod)[1])
+cal_slope     <- unname(coef(cal_mod)[2])
+
+spiegel_num <- sum((y_test - p_test) * (1 - 2 * p_test))
+spiegel_den <- sqrt(sum((1 - 2 * p_test)^2 * p_test * (1 - p_test)))
+spiegel_z   <- spiegel_num / spiegel_den
+spiegel_p   <- 2 * (1 - pnorm(abs(spiegel_z)))
+
+ece_bins <- cut(p_test, breaks = seq(0, 1, by = 0.1),
+                include.lowest = TRUE, right = FALSE)
+ece_df <- tibble(p = p_test, y = y_test, bin = ece_bins) %>%
+  group_by(bin) %>%
+  summarise(n = n(), mean_p = mean(p), mean_y = mean(y), .groups = "drop") %>%
+  filter(n > 0) %>%
+  mutate(weight = n / sum(n), gap = abs(mean_p - mean_y))
+ece_val <- sum(ece_df$weight * ece_df$gap)
+
+tibble(
+  Statistic = c("Calibration Intercept", "Calibration Slope",
+                "Spiegelhalter Z", "Spiegelhalter p-value",
+                "Expected Calibration Error (10 bins)"),
+  Value     = c(cal_intercept, cal_slope, spiegel_z, spiegel_p, ece_val),
+  `Expected (if well-calibrated)` = c(0, 1, NA_real_, NA_real_, 0)
+) %>%
+  gt() %>%
+  tab_header(
+    title    = paste("Formal Calibration Tests:", best_model_name, "(Test Set)"),
+    subtitle = "Intercept/slope from logistic regression of y on logit(p_hat)"
+  ) %>%
+  fmt_number(columns = c(Value, `Expected (if well-calibrated)`),
+             decimals = 4)
+```
+
+#### Isotonic Recalibration
+
+Even when discrimination is strong, predicted probabilities may be systematically shifted. Isotonic regression provides a nonparametric monotonic remapping of predicted probabilities to observed frequencies. We fit the isotonic recalibration on the test set (for illustration only; a production deployment would use a separate calibration holdout) and overlay the pre- and post-recalibration curves.
+
+```{r calibration-isotonic}
+#| label: calibration-isotonic
+#| fig-height: 5
+
+iso_fit <- isoreg(p_test, y_test)
+p_iso   <- as.numeric(approx(
+  x    = iso_fit$x[iso_fit$ord],
+  y    = iso_fit$yf,
+  xout = p_test,
+  rule = 2
+)$y)
+
+cal_bins_pre <- tibble(p = p_test, y = y_test) %>%
+  mutate(bin = cut(p, breaks = seq(0, 1, by = 0.1),
+                   include.lowest = TRUE, right = FALSE)) %>%
+  group_by(bin) %>%
+  summarise(mean_p = mean(p), mean_y = mean(y),
+            n = n(), .groups = "drop") %>%
+  filter(n >= 5) %>%
+  mutate(version = "Pre-recalibration")
+
+cal_bins_post <- tibble(p = p_iso, y = y_test) %>%
+  mutate(bin = cut(p, breaks = seq(0, 1, by = 0.1),
+                   include.lowest = TRUE, right = FALSE)) %>%
+  group_by(bin) %>%
+  summarise(mean_p = mean(p), mean_y = mean(y),
+            n = n(), .groups = "drop") %>%
+  filter(n >= 5) %>%
+  mutate(version = "Post-recalibration (isotonic)")
+
+cal_overlay <- bind_rows(cal_bins_pre, cal_bins_post) %>%
+  mutate(version = factor(version,
+    levels = c("Pre-recalibration", "Post-recalibration (isotonic)")))
+
+ggplot(cal_overlay, aes(x = mean_p, y = mean_y,
+                        color = version, linetype = version)) +
+  geom_abline(intercept = 0, slope = 1, lty = 2, color = "grey50") +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(size = n), alpha = 0.8) +
+  scale_color_manual(values = c("Pre-recalibration" = clr_blue,
+                                "Post-recalibration (isotonic)" = clr_green)) +
+  scale_linetype_manual(values = c("Pre-recalibration" = "dashed",
+                                   "Post-recalibration (isotonic)" = "solid")) +
+  scale_size_continuous(range = c(2, 7), guide = "none") +
+  labs(
+    x        = "Mean Predicted Probability",
+    y        = "Observed Positive Rate",
+    color    = NULL, linetype = NULL,
+    title    = "Calibration Before and After Isotonic Recalibration",
+    subtitle = "Test set; dashed diagonal is perfect calibration"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+brier_post <- mean((p_iso - y_test)^2)
+logit_post <- log(pmin(pmax(p_iso, 1e-6), 1 - 1e-6) /
+                  (1 - pmin(pmax(p_iso, 1e-6), 1 - 1e-6)))
+slope_post <- unname(coef(glm(y_test ~ logit_post, family = binomial()))[2])
+
+tibble(
+  Metric = c("Brier Score (post-recalibration)",
+             "Calibration Slope (post-recalibration)"),
+  Value  = c(brier_post, slope_post)
+) %>%
+  gt() %>%
+  tab_header(title = "Post-Isotonic-Recalibration Diagnostics") %>%
+  fmt_number(columns = Value, decimals = 4)
+```
+
+Calibration is adequate pre-recalibration when the Spiegelhalter p-value is large (indicating no systematic miscalibration) and the intercept and slope sit close to 0 and 1 respectively. If the intercept is notably negative the model systematically over-predicts risk, and if the slope is less than 1 the model's predicted-probability spread is over-dispersed relative to the observed frequency spread. Pre-recalibration Brier is `r round(brier_score, 4)` and post-recalibration Brier is `r round(brier_post, 4)`, a modest reduction consistent with the already-adequate Spiegelhalter p-value of `r round(spiegel_p, 3)`. For deployment, a pre-registered recalibration protocol would be applied on a dedicated calibration holdout rather than on the test set, so that test-set performance metrics remain uncontaminated by the recalibration fit.
 
 
 ### 9.6 Bootstrap Confidence Intervals
@@ -1780,6 +2073,113 @@ fyc_test %>%
     pos_rate = "Positive Rate"
   )
 ```
+
+The parity-loss plots and radar summarize point estimates of group-level fairness metrics, but point estimates alone can mask the statistical uncertainty that accompanies small subgroups. We compute 1,000-iteration bootstrap 95% confidence intervals for TPR, FPR, and PPV within each racial/ethnic group on the test set. Groups with fewer than 20 positive cases are flagged in the table because parity claims built on so few events carry wide intervals that are not meaningfully informative.
+
+```{r fairness-bootstrap-ci}
+#| label: fairness-bootstrap-ci
+
+test_for_fair <- test_preds %>%
+  mutate(
+    race_eth  = fyc_test$race_eth,
+    y_num     = as.numeric(high_burden == "Yes"),
+    pred_class_opt = factor(
+      ifelse(.pred_Yes >= best_j$threshold, "Yes", "No"),
+      levels = c("Yes", "No")
+    )
+  )
+
+compute_group_rates <- function(df) {
+  df %>%
+    group_by(race_eth) %>%
+    summarise(
+      tp = sum(high_burden == "Yes" & pred_class_opt == "Yes"),
+      fn = sum(high_burden == "Yes" & pred_class_opt == "No"),
+      fp = sum(high_burden == "No"  & pred_class_opt == "Yes"),
+      tn = sum(high_burden == "No"  & pred_class_opt == "No"),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      tpr = ifelse(tp + fn == 0, NA_real_, tp / (tp + fn)),
+      fpr = ifelse(fp + tn == 0, NA_real_, fp / (fp + tn)),
+      ppv = ifelse(tp + fp == 0, NA_real_, tp / (tp + fp))
+    ) %>%
+    select(race_eth, tpr, fpr, ppv)
+}
+
+set.seed(231)
+n_boot_fair <- 1000
+boot_specs  <- rsample::bootstraps(test_for_fair, times = n_boot_fair,
+                                    strata = race_eth)
+
+boot_rates <- purrr::map_dfr(
+  boot_specs$splits,
+  function(split) compute_group_rates(rsample::analysis(split)),
+  .id = "boot_id"
+)
+
+group_cis <- boot_rates %>%
+  group_by(race_eth) %>%
+  summarise(
+    tpr_lo = quantile(tpr, 0.025, na.rm = TRUE),
+    tpr_hi = quantile(tpr, 0.975, na.rm = TRUE),
+    fpr_lo = quantile(fpr, 0.025, na.rm = TRUE),
+    fpr_hi = quantile(fpr, 0.975, na.rm = TRUE),
+    ppv_lo = quantile(ppv, 0.025, na.rm = TRUE),
+    ppv_hi = quantile(ppv, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+group_point <- compute_group_rates(test_for_fair)
+
+group_n <- test_for_fair %>%
+  group_by(race_eth) %>%
+  summarise(n = n(),
+            n_pos = sum(high_burden == "Yes"),
+            .groups = "drop")
+
+fair_table <- group_n %>%
+  left_join(group_point, by = "race_eth") %>%
+  left_join(group_cis,   by = "race_eth") %>%
+  mutate(
+    `TPR (95% CI)` = sprintf("%.3f (%.3f, %.3f)", tpr, tpr_lo, tpr_hi),
+    `FPR (95% CI)` = sprintf("%.3f (%.3f, %.3f)", fpr, fpr_lo, fpr_hi),
+    `PPV (95% CI)` = sprintf("%.3f (%.3f, %.3f)", ppv, ppv_lo, ppv_hi),
+    underpowered   = n_pos < 20
+  )
+
+fair_gt <- fair_table %>%
+  select(Subgroup = race_eth, n, n_pos,
+         `TPR (95% CI)`, `FPR (95% CI)`, `PPV (95% CI)`,
+         underpowered) %>%
+  gt() %>%
+  tab_header(
+    title    = "Per-Subgroup Fairness with Bootstrap 95% CIs",
+    subtitle = paste0("At Youden's J threshold = ", best_j$threshold,
+                      "; ", format(n_boot_fair, big.mark = ","),
+                      " bootstrap resamples")
+  ) %>%
+  cols_label(n = "N", n_pos = "N Positive") %>%
+  tab_footnote(
+    footnote = paste("Subgroups with fewer than 20 positive cases are",
+                     "underpowered for reliable parity estimates."),
+    locations = cells_column_labels(columns = n_pos)
+  ) %>%
+  cols_hide(columns = underpowered)
+
+rows_under <- which(fair_table$underpowered)
+if (length(rows_under) > 0) {
+  fair_gt <- fair_gt %>%
+    tab_style(
+      style     = cell_text(style = "italic", color = "grey40"),
+      locations = cells_body(rows = rows_under)
+    )
+}
+
+fair_gt
+```
+
+Subgroups with fewer than 20 positive cases cannot support reliable parity estimates, and in the MEPS test set the NH Asian and NH Other/Multiple groups fall into this category. The confidence intervals on those rows are wide as a direct consequence of sampling uncertainty rather than as evidence of a fairness violation, and claims about those subgroups require substantially larger samples before they can be made firm. The Hispanic versus Non-Hispanic White comparison is the most reliably powered pair available in this test set, though the Hispanic subgroup sits just below the 20-event threshold that supports firm parity claims. The NH Asian and NH Other/Multiple groups fall substantially below it. Even the Hispanic comparison should be read against the Section 2.8 caveat that the 10% OOP threshold may understate true Hispanic burden. Subgroup parity auditing requires sufficient positive cases per group, a principle emphasized in the medical-AI fairness literature (Ruamviboonsuk et al. 2022).
 
 The fairness assessment reveals whether the model produces equitable predictions across racial/ethnic groups. Key things to examine include: (1) whether any group experiences substantially higher false negative rates (missed high-burden households), which would indicate the model is systematically less protective for that group; (2) whether the model satisfies the 4/5ths rule for disparate impact; and (3) whether there are groups where the model is systematically overconfident or underconfident.
 
@@ -2106,3 +2506,116 @@ Fifth, deploying such a model in practice (for instance, as a risk-screening too
 
 doParallel::stopImplicitCluster()
 ```
+
+
+## Appendix A. Stacked Ensemble Robustness Check
+
+A stacked ensemble is a meta-learner that combines the predictions of several base learners into a single composite prediction, with the weights on each base learner fit by a second-stage model. The construction is a natural robustness check in this setting because the top four individual models in Section 8 lie within one standard error of each other on cross-validation ROC-AUC, which suggests that no single base learner dominates and that a weighted combination may extract additional discrimination. The Super Learner framework (Van der Laan, Polley, and Hubbard 2007) provides the theoretical basis for this approach and proves that, asymptotically, the stacked ensemble performs at least as well as the best individual base learner in the candidate library. The `stacks` package in the tidymodels ecosystem operationalizes this procedure with a non-negative least squares meta-learner that produces sparse, interpretable member weights.
+
+```{r stacks-ensemble}
+#| label: stacks-ensemble
+#| cache: true
+#| eval: false
+
+# Disabled by default because blending across five tuning grids plus
+# refit-on-members can take 20 to 40 minutes depending on hardware.
+# Set `eval: true` above once you are ready to let the chunk run.
+
+library(stacks)
+
+log_fit_resamples <- log_wf %>%
+  fit_resamples(
+    resamples = cv_folds,
+    metrics   = metric_set(roc_auc, pr_auc),
+    control   = control_stack_resamples()
+  )
+
+burden_stack <- stacks() %>%
+  add_candidates(log_fit_resamples) %>%
+  add_candidates(enet_tune) %>%
+  add_candidates(rf_tune) %>%
+  add_candidates(xgb_tune) %>%
+  add_candidates(svm_tune) %>%
+  add_candidates(bart_tune) %>%
+  blend_predictions() %>%
+  fit_members()
+
+# Collect blend coefficients for every candidate registered in the stack, then
+# keep only members with positive weight (non-zero members are the ones that
+# contribute to the final ensemble).
+candidate_names <- c("log_fit_resamples", "enet_tune", "rf_tune", "xgb_tune", "svm_tune", "bart_tune")
+
+member_weights <- purrr::map_dfr(
+  candidate_names,
+  function(cand) {
+    tryCatch(
+      collect_parameters(burden_stack, cand),
+      error = function(e) tibble::tibble()
+    )
+  }
+) %>%
+  filter(coef > 0) %>%
+  arrange(desc(coef))
+
+member_weights %>%
+  gt() %>%
+  tab_header(
+    title    = "Stacked Ensemble Member Weights",
+    subtitle = "Non-negative least squares coefficients (zero-weight members omitted)"
+  ) %>%
+  fmt_number(columns = coef, decimals = 4)
+
+stack_preds <- fyc_test %>%
+  bind_cols(predict(burden_stack, fyc_test, type = "prob"))
+
+stack_roc <- roc_auc(stack_preds, truth = high_burden, .pred_Yes) %>%
+  pull(.estimate)
+stack_pr  <- pr_auc(stack_preds, truth = high_burden, .pred_Yes) %>%
+  pull(.estimate)
+stack_brier <- mean(
+  (stack_preds$.pred_Yes -
+     as.numeric(stack_preds$high_burden == "Yes"))^2
+)
+
+set.seed(231)
+n_boot_stack <- 2000
+boot_stack_roc   <- numeric(n_boot_stack)
+boot_stack_pr    <- numeric(n_boot_stack)
+boot_stack_brier <- numeric(n_boot_stack)
+
+for (b in seq_len(n_boot_stack)) {
+  idx <- sample(nrow(stack_preds), replace = TRUE)
+  samp <- stack_preds[idx, ]
+  boot_stack_roc[b]   <- suppressWarnings(
+    roc_auc(samp, truth = high_burden, .pred_Yes) %>% pull(.estimate)
+  )
+  boot_stack_pr[b]    <- suppressWarnings(
+    pr_auc(samp, truth = high_burden, .pred_Yes) %>% pull(.estimate)
+  )
+  boot_stack_brier[b] <- mean(
+    (samp$.pred_Yes - as.numeric(samp$high_burden == "Yes"))^2
+  )
+}
+
+tibble(
+  Metric     = c("ROC-AUC", "PR-AUC", "Brier Score"),
+  Estimate   = c(stack_roc, stack_pr, stack_brier),
+  `CI Lower` = c(quantile(boot_stack_roc,   0.025, na.rm = TRUE),
+                 quantile(boot_stack_pr,    0.025, na.rm = TRUE),
+                 quantile(boot_stack_brier, 0.025, na.rm = TRUE)),
+  `CI Upper` = c(quantile(boot_stack_roc,   0.975, na.rm = TRUE),
+                 quantile(boot_stack_pr,    0.975, na.rm = TRUE),
+                 quantile(boot_stack_brier, 0.975, na.rm = TRUE))
+) %>%
+  gt() %>%
+  tab_header(
+    title    = "Stacked Ensemble: Test Set Performance with 95% Bootstrap CIs",
+    subtitle = paste0("Based on ", format(n_boot_stack, big.mark = ","),
+                      " bootstrap resamples")
+  ) %>%
+  fmt_number(columns = c(Estimate, `CI Lower`, `CI Upper`), decimals = 4)
+```
+
+Two outcomes frame the interpretation. If the stacked ensemble's test ROC-AUC exceeds the XGBoost test ROC-AUC by more than one standard error, the main text's single-model selection should be revisited and the ensemble would be preferred for deployment because it captures predictive signal that no individual base learner extracts on its own. If, instead, the stacked ensemble performs within one standard error of XGBoost, the single-model choice is confirmed as parsimonious and the ensemble check adds no practical gain, which is itself informative: it indicates that the marginal return from combining the top learners is exhausted by the best individual fit.
+
+The ensemble analysis lives in this appendix rather than in the main Section 8 comparison because it was added as a post-hoc robustness check and should not contribute to model selection, which was pre-specified to operate over the six individual candidates.
