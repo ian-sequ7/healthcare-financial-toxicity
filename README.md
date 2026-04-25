@@ -1,6 +1,6 @@
 # Healthcare Financial Toxicity Prediction
 
-PSTAT 231 Final Project — predicting catastrophic out-of-pocket healthcare burden on 20,962 MEPS 2022 respondents.
+Over 25 million Americans skip or delay medical care because of cost. This project predicts which households face catastrophic out-of-pocket burden across **20,962 respondents from the 2022 MEPS**. Six classifiers are tuned under 10-fold cross-validation, with XGBoost reaching **ROC-AUC 0.874**. The pipeline runs subgroup fairness audits across race and ethnicity, and interprets feature contributions via SHAP odds ratios. Final project for PSTAT 231 (Graduate Statistical ML) at UCSB.
 
 **Rendered write-up:** https://ian-sequ7.github.io/healthcare-financial-toxicity/final_project_resume.html
 

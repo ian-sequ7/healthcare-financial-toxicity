@@ -814,7 +814,7 @@ The tuning surface reveals the interplay between regularization strength and the
 
 ### 7.3 Random Forest
 
-We tune the number of features considered at each split (`mtry`) and the minimum node size (`min_n`). The grid spans `mtry` from 3 to 15 (out of about 24 features after dummy encoding) and `min_n` from 5 to 30.
+We tune the number of features considered at each split (`mtry`) and the minimum node size (`min_n`). The grid spans `mtry` from 3 to 15 (out of about 24 features after dummy encoding) and `min_n` from 5 to 30. The `mtry` range brackets the conventional $\sqrt{p}$ heuristic ($\sqrt{24} \approx 4.9$) on both sides; `min_n` from 5 to 30 spans nearly-fully-grown trees (lower bias, higher variance) to mildly regularized leaves. A $5 \times 5$ regular grid yields 25 candidate configurations, with the number of trees fixed at 500 (where OOB error typically plateaus for samples of this size).
 
 ```{r tune-rf}
 #| label: tune-rf
@@ -859,7 +859,7 @@ Random forest performance is relatively stable across the tuning grid, which is 
 
 ### 7.4 XGBoost
 
-XGBoost has the richest hyperparameter space. We tune tree depth (3 to 8), learning rate ($10^{-2}$ to $10^{-0.5} \approx 0.32$), and minimum node size (5 to 30) over a 64-point regular grid. This is the most computationally intensive tuning step, requiring $64 \times 10 = 640$ individual model fits.
+XGBoost has the richest hyperparameter space. We tune tree depth (3 to 8), learning rate ($10^{-2}$ to $10^{-0.5} \approx 0.32$), and minimum node size (5 to 30) over a 64-point regular grid ($4^3 = 64$ levels). Tree depth 3-8 spans shallow stumps to moderately complex trees, deliberately stopping short of deep trees that would risk overfitting on a roughly 16k-row training sample. The log-spaced learning rate range trades bias against computational cost: lower rates require more boosting rounds but typically generalize better. The `min_n` range mirrors the random forest grid for direct cross-method comparability. This is the most computationally intensive tuning step, requiring $64 \times 10 = 640$ individual model fits.
 
 ```{r tune-xgb}
 #| label: tune-xgb
@@ -905,8 +905,7 @@ The XGBoost tuning surface illustrates the trade-off between model complexity an
 
 ### 7.5 SVM (Radial Basis Function)
 
-We tune the cost parameter ($10^{-2}$ to $10^{2}$) and kernel bandwidth ($10^{-3}$ to
-$10^{0}$) over a 25-point grid.
+We tune the cost parameter ($10^{-2}$ to $10^{2}$) and kernel bandwidth ($10^{-3}$ to $10^{0}$) over a $5 \times 5 = 25$-point grid. The cost range spans four orders of magnitude, from heavy regularization (small $C$, smooth decision boundary, higher bias) to near hard-margin (large $C$, complex boundary, higher variance). The `rbf_sigma` range covers narrow kernels (localized, high variance) through wide kernels (near-linear separator, low variance). This grid is intentionally coarse but spans the full bias-variance frontier; finer grids near the optimum could be considered if compute budget allowed.
 
 ```{r tune-svm}
 #| label: tune-svm
@@ -1406,6 +1405,8 @@ In a clinical or policy deployment context, false negatives (failing to identify
 #### Threshold Optimization
 
 The default 0.50 threshold is poorly suited to this problem. With only ~5% prevalence, most observations receive predicted probabilities well below 0.50, so the model rarely predicts "Yes" at the default cutoff. We sweep thresholds from 0.05 to 0.80 and compute sensitivity (recall), specificity, precision, and the F1 score at each. Youden's J statistic ($J = \text{sensitivity} + \text{specificity} - 1$) identifies the threshold that maximizes the combined ability to detect both classes, while F1 balances precision and recall for the minority class specifically.
+
+Which criterion to use depends on how the model gets deployed. For a screening tool that flags households for financial counseling, where a false alarm only costs an unnecessary referral but a missed case can mean delayed care or bankruptcy, Youden's J is the natural choice because it weights sensitivity and specificity equally. If counselor capacity is limited and only the highest-risk households can actually be served, F1 (or precision at a fixed recall) makes more sense since it rewards positive predictive value directly. A fully cost-sensitive setup with monetized utilities for each confusion matrix cell would replace both with a Bayes-risk-minimizing threshold, but that requires utility elicitation outside this project's scope. We use Youden's J as the operating point under the screening framing, and report the F1-optimal threshold alongside so other use cases can pick what fits.
 
 ```{r threshold-sweep}
 #| label: threshold-sweep
@@ -2486,7 +2487,7 @@ The sensitivity analyses demonstrated three key findings. First, healthcare util
 
 ### 11.2 Limitations
 
-Several limitations are worth acknowledging. First, the cross-sectional design of MEPS precludes causal inference. We cannot determine whether poverty *causes* financial toxicity or merely correlates with it through shared confounders such as health literacy, geographic access to care, or employment stability. Second, although MEPS provides survey weights to produce nationally representative estimates, we did not incorporate these weights into the machine learning pipeline. Tidymodels does not natively support survey-weighted loss functions, so our predictions reflect unweighted associations and may not generalize precisely to population-level prevalence. Third, although Section 9.5 presents a calibration assessment with a Brier score, we did not apply formal calibration tests (e.g., the Hosmer-Lemeshow test) or post-hoc recalibration methods (Platt scaling or isotonic regression). These would strengthen confidence in the predicted probabilities for deployment scenarios. Fourth, the fairness audit (Section 9.7) identifies group-level disparities but does not implement mitigation strategies such as group-specific threshold calibration or post-processing fairness constraints. These would be essential for a production deployment.
+Several limitations are worth acknowledging. First, the cross-sectional design of MEPS precludes causal inference. We cannot determine whether poverty *causes* financial toxicity or merely correlates with it through shared confounders such as health literacy, geographic access to care, or employment stability. Second, although MEPS provides survey weights to produce nationally representative estimates, we did not incorporate these weights into the machine learning pipeline. Tidymodels does not natively support survey-weighted loss functions, so our predictions reflect unweighted associations and may not generalize precisely to population-level prevalence. Third, while Section 9.5 presents formal calibration tests (Spiegelhalter Z, intercept/slope diagnostics, Expected Calibration Error) and demonstrates isotonic recalibration, the recalibration was fit on the test set itself for illustration. A production deployment would require a pre-registered recalibration protocol on a dedicated calibration holdout so that test-set performance metrics remain uncontaminated by the recalibration fit. Fourth, the fairness audit (Section 9.7) identifies group-level disparities but does not implement mitigation strategies such as group-specific threshold calibration or post-processing fairness constraints. These would be essential for a production deployment.
 
 ### 11.3 Future Directions
 
